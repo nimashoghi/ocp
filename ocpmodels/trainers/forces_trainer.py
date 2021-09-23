@@ -527,6 +527,13 @@ class ForcesTrainer(BaseTrainer):
 
     def _compute_loss(self, out, batch_list):
         loss = []
+        atomic_numbers = torch.cat(
+            [
+                batch.atomic_numbers.long().to(self.device)
+                for batch in batch_list
+            ],
+            dim=0,
+        )
 
         # Energy loss.
         energy_target = torch.cat(
@@ -535,6 +542,7 @@ class ForcesTrainer(BaseTrainer):
         if self.normalizer.get("normalize_labels", False):
             energy_target = self.normalizers["target"].norm(energy_target)
         energy_mult = self.config["optim"].get("energy_coefficient", 1)
+
         loss.append(
             energy_mult * self.loss_fn["energy"](out["energy"], energy_target)
         )
@@ -594,13 +602,19 @@ class ForcesTrainer(BaseTrainer):
                     loss.append(
                         force_mult
                         * self.loss_fn["force"](
-                            out["forces"][mask], force_target[mask]
+                            out["forces"][mask],
+                            force_target[mask],
+                            atomic_numbers=atomic_numbers[mask],
                         )
                     )
                 else:
                     loss.append(
                         force_mult
-                        * self.loss_fn["force"](out["forces"], force_target)
+                        * self.loss_fn["force"](
+                            out["forces"],
+                            force_target,
+                            atomic_numbers=atomic_numbers,
+                        )
                     )
         # Sanity check to make sure the compute graph is correct.
         for lc in loss:

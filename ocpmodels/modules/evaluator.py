@@ -94,7 +94,7 @@ class Evaluator:
         res = eval(fn)(prediction, target)
         # for atomwise metrics, we add a prefix to the metric name (e.g., "atomwise_19_forces_mae")
         fn_metric_name = f"{fn_prefix}{fn}" if fn_prefix else fn
-        return self.update(fn_metric_name, res, metrics)
+        return self.update(fn_metric_name, res, metrics), res
 
     def _eval_atomwise_metrics(
         self, fn, atomic_numbers, prediction, target, metrics
@@ -107,7 +107,9 @@ class Evaluator:
         assert metric_key == "forces" or metric_key == "energy"
         assert metric_key in prediction and metric_key in target
 
-        # create a copy of prediction and target where the results are set to 0 for atoms that are not in atomic_numbers
+        results = dict()
+
+        # create a copy of prediction and target where the results are masked away for atoms that are not in atomic_numbers
         for atomic_number in self.atomic_number_map.keys():
             mask = atomic_numbers == atomic_number
 
@@ -125,15 +127,16 @@ class Evaluator:
             ):
                 continue
 
-            metrics = self._eval_metric_fn(
+            metrics, res = self._eval_metric_fn(
                 fn,
                 prediction_copy,
                 target_copy,
                 metrics,
                 fn_prefix=f"atomwise_{self.atomic_number_map[atomic_number]}_",
             )
+            results[atomic_number] = res
 
-        return metrics
+        return metrics, results
 
     def eval(self, prediction, target, prev_metrics={}, atomic_numbers=None):
         for attr in self.task_attributes[self.task]:
@@ -144,13 +147,19 @@ class Evaluator:
         metrics = prev_metrics
 
         for fn in self.task_metrics[self.task]:
-            metrics = self._eval_metric_fn(fn, prediction, target, metrics)
+            metrics, _ = self._eval_metric_fn(fn, prediction, target, metrics)
 
             # should we track atom-wise stats for this metric?
             if atomic_numbers is not None and fn in self.atomic_number_metrics:
-                metrics = self._eval_atomwise_metrics(
+                metrics, _ = self._eval_atomwise_metrics(
                     fn, atomic_numbers, prediction, target, metrics
                 )
+
+                # if all(
+                #     res["metric"] > global_res["metric"]
+                #     for res in atomwise_res.values()
+                # ):
+                #     breakpoint()
 
         return metrics
 

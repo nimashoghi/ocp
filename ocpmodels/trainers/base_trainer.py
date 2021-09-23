@@ -359,6 +359,28 @@ class BaseTrainer(ABC):
             if self.scaler and checkpoint["amp"]:
                 self.scaler.load_state_dict(checkpoint["amp"])
 
+    def _wrap_loss_function(self, loss_function):
+        atomwise_loss_mask = self.config["task"].get("atomwise_loss_mask", [])
+        if not atomwise_loss_mask:
+            return loss_function
+
+        def wrapper(
+            input: torch.Tensor,
+            target: torch.Tensor,
+            atomic_numbers: torch.Tensor = None,
+        ):
+            if atomic_numbers is None:
+                return loss_function(input, target)
+
+            mask = torch.zeros_like(atomic_numbers, dtype=torch.bool).to(
+                self.device
+            )
+            for atomic_number in atomwise_loss_mask:
+                mask[atomic_numbers == atomic_number] = True
+            return loss_function(input[mask], target[mask])
+
+        return wrapper
+
     def load_loss(self):
         self.loss_fn = {}
         self.loss_fn["energy"] = self.config["optim"].get("loss_energy", "mae")
@@ -374,6 +396,9 @@ class BaseTrainer(ABC):
                 raise NotImplementedError(
                     f"Unknown loss function name: {loss_name}"
                 )
+
+        for loss, loss_fn in self.loss_fn.items():
+            self.loss_fn[loss] = self._wrap_loss_function(loss_fn)
 
     def load_optimizer(self):
         optimizer = self.config["optim"].get("optimizer", "AdamW")
