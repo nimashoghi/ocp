@@ -11,3 +11,4 @@ from .forcenet import ForceNet
 from .gemnet.gemnet import GemNetT
 from .schnet import SchNetWrap as SchNet
 from .spinconv import spinconv
+from .transformer.transformer import Transformer

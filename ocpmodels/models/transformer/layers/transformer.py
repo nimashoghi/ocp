@@ -409,6 +409,7 @@ class TransformerEncoder(Module):
         src: Tensor,
         mask: Optional[Tensor] = None,
         src_key_padding_mask: Optional[Tensor] = None,
+        **kwargs
     ) -> Tensor:
         r"""Pass the input through the encoder layers in turn.
 

@@ -1,3 +1,4 @@
+import numpy as np
 import torch
 import torch.nn as nn
 
@@ -9,9 +10,7 @@ class AtomEmbedding(nn.Module):
         self.embedding = nn.Embedding(max_atom_index, embedding_dim)
         self.dropout_layer = nn.Dropout(dropout)
 
-        nn.init.uniform_(
-            self.embeddings.weight, a=-torch.sqrt(3), b=torch.sqrt(3)
-        )
+        nn.init.uniform_(self.embedding.weight, a=-np.sqrt(3), b=np.sqrt(3))
 
     def forward(self, x: torch.Tensor):
         x = self.embedding(x)
