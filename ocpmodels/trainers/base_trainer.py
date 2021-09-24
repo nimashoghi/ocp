@@ -40,7 +40,7 @@ from ocpmodels.modules.evaluator import Evaluator
 from ocpmodels.modules.exponential_moving_average import (
     ExponentialMovingAverage,
 )
-from ocpmodels.modules.loss import L2MAELoss
+from ocpmodels.modules.loss import DDPLoss, L2MAELoss
 from ocpmodels.modules.normalizer import Normalizer
 from ocpmodels.modules.scheduler import LRScheduler
 
@@ -197,7 +197,7 @@ class BaseTrainer(ABC):
 
         self.evaluator = Evaluator(
             task=name,
-            atomic_number_map=self.config["task"].get(
+            atomwise_metric_atoms=self.config["task"].get(
                 "atomwise_metric_atoms", None
             ),
             atomic_number_metrics=self.config["task"].get(
@@ -396,6 +396,8 @@ class BaseTrainer(ABC):
                 raise NotImplementedError(
                     f"Unknown loss function name: {loss_name}"
                 )
+            if distutils.initialized():
+                self.loss_fn[loss] = DDPLoss(self.loss_fn[loss])
 
         for loss, loss_fn in self.loss_fn.items():
             self.loss_fn[loss] = self._wrap_loss_function(loss_fn)
@@ -560,7 +562,7 @@ class BaseTrainer(ABC):
         evaluator, metrics = (
             Evaluator(
                 task=self.name,
-                atomic_number_map=self.config["task"].get(
+                atomwise_metric_atoms=self.config["task"].get(
                     "atomwise_metric_atoms", None
                 ),
                 atomic_number_metrics=self.config["task"].get(
