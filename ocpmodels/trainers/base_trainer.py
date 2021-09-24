@@ -361,15 +361,13 @@ class BaseTrainer(ABC):
 
     def _wrap_loss_function(self, loss_function):
         atomwise_loss_mask = self.config["task"].get("atomwise_loss_mask", [])
-        if not atomwise_loss_mask:
-            return loss_function
 
         def wrapper(
             input: torch.Tensor,
             target: torch.Tensor,
             atomic_numbers: torch.Tensor = None,
         ):
-            if atomic_numbers is None:
+            if not atomwise_loss_mask or atomic_numbers is None:
                 return loss_function(input, target)
 
             mask = torch.zeros_like(atomic_numbers, dtype=torch.bool).to(

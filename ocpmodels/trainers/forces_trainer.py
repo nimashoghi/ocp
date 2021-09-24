@@ -510,6 +510,30 @@ class ForcesTrainer(BaseTrainer):
         # forward pass.
         if self.config["model_attributes"].get("regress_forces", True):
             out_energy, out_forces = self.model(batch_list)
+
+            atomwise_constant_force_map = self.config["task"].get(
+                "atomwise_constant_force_map", dict()
+            )
+            if atomwise_constant_force_map:
+                atomic_numbers = torch.cat(
+                    [
+                        batch.atomic_numbers.long().to(self.device)
+                        for batch in batch_list
+                    ],
+                    dim=0,
+                )
+                for (
+                    atomic_number,
+                    constant_value,
+                ) in atomwise_constant_force_map.items():
+                    out_forces[
+                        atomic_numbers == int(atomic_number)
+                    ] = torch.tensor(
+                        constant_value,
+                        dtype=out_forces.dtype,
+                        device=out_forces.device,
+                    )
+
         else:
             out_energy = self.model(batch_list)
 
