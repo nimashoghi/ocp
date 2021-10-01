@@ -133,7 +133,7 @@ class GemNetT(torch.nn.Module):
         activation: str = "swish",
         scale_file: Optional[str] = None,
         enable_tag_embedding: bool = False,
-        tag_embedding_size: int = 256,
+        tag_embedding_size: Optional[int] = None,
         atom_tag_combine_method: Literal["bilinear", "concat"] = "concat",
     ):
         super().__init__()
@@ -206,6 +206,7 @@ class GemNetT(torch.nn.Module):
         ### ------------------------------------------------------------------------------------- ###
 
         # Embedding block
+        tag_embedding_size = tag_embedding_size or emb_size_atom
         self.enable_tag_embedding = enable_tag_embedding
         self.atom_tag_combine_method = atom_tag_combine_method
         atom_emb_size_out = emb_size_atom
