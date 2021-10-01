@@ -132,6 +132,8 @@ class GemNetT(torch.nn.Module):
         output_init: str = "HeOrthogonal",
         activation: str = "swish",
         scale_file: Optional[str] = None,
+        tag_size_atom: int = 0,
+        tag_use_method: str = "concat",
     ):
         super().__init__()
         self.num_targets = num_targets
@@ -203,7 +205,19 @@ class GemNetT(torch.nn.Module):
         ### ------------------------------------------------------------------------------------- ###
 
         # Embedding block
-        self.atom_emb = AtomEmbedding(emb_size_atom)
+        self.tag_size_atom = tag_size_atom
+        self.tag_use_method = tag_use_method
+
+        assert self.tag_use_method in ["bilinear", "concat"]
+        if self.tag_use_method == "bilinear":
+            self.atom_emb_bilinear = torch.nn.Bilinear(
+                in1_features=emb_size_atom - tag_size_atom,
+                in2_features=tag_size_atom,
+                out_features=emb_size_atom,
+            )
+
+        self.atom_emb = AtomEmbedding(emb_size_atom - tag_size_atom)
+
         self.edge_emb = EdgeEmbedding(
             emb_size_atom, num_radial, emb_size_edge, activation=activation
         )
@@ -503,6 +517,23 @@ class GemNetT(torch.nn.Module):
             id3_ragged_idx,
         )
 
+    def _get_tag_features(self, tags: torch.Tensor):
+        # - tags (tensor): Tag information - 0 for adsorbate, 1 for surface, 2 for subsurface. Optional, can be used for training.
+        # we take this data and represent adsorbates as [0, 0, 1], surfaces as [1, 1, 0], subsurfaces as [0, 1, 0]
+        # we then concatenate these to the atomic features
+        tag_features = torch.zeros(
+            tags.size(0), self.tag_size_atom, device=tags.device
+        )
+
+        is_adsorbate = tags == 0
+        is_surface = tags == 1
+
+        tag_features[is_adsorbate, 0] = 1
+        tag_features[~is_adsorbate, 1] = 1
+        tag_features[is_surface, 2] = 1
+
+        return tag_features
+
     @conditional_grad(torch.enable_grad())
     def forward(self, data):
         pos = data.pos
@@ -532,6 +563,12 @@ class GemNetT(torch.nn.Module):
 
         # Embedding block
         h = self.atom_emb(atomic_numbers)
+        if self.tag_size_atom > 0:
+            tags = self._get_tag_features(data.tags)
+            if self.tag_use_method == "bilinear":
+                h = self.atom_emb_bilinear(h, tags)
+            elif self.tag_use_method == "concat":
+                h = torch.cat([h, tags], dim=1)
         # (nAtoms, emb_size_atom)
         m = self.edge_emb(h, rbf, idx_s, idx_t)  # (nEdges, emb_size_edge)
 
