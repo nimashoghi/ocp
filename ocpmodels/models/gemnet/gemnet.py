@@ -5,7 +5,7 @@ This source code is licensed under the MIT license found in the
 LICENSE file in the root directory of this source tree.
 """
 
-from typing import Optional
+from typing import Literal, Optional
 
 import numpy as np
 import torch
@@ -22,7 +22,7 @@ from ocpmodels.common.utils import (
 from .layers.atom_update_block import OutputBlock
 from .layers.base_layers import Dense
 from .layers.efficient import EfficientInteractionDownProjection
-from .layers.embedding_block import AtomEmbedding, EdgeEmbedding
+from .layers.embedding_block import AtomEmbedding, EdgeEmbedding, TagEmbedding
 from .layers.interaction_block import (
     InteractionBlockTripletsOnly,
 )
@@ -132,8 +132,9 @@ class GemNetT(torch.nn.Module):
         output_init: str = "HeOrthogonal",
         activation: str = "swish",
         scale_file: Optional[str] = None,
-        tag_size_atom: int = 0,
-        tag_use_method: str = "concat",
+        enable_tag_embedding: bool = False,
+        tag_embedding_size: int = 256,
+        atom_tag_combine_method: Literal["bilinear", "concat"] = "concat",
     ):
         super().__init__()
         self.num_targets = num_targets
@@ -205,19 +206,23 @@ class GemNetT(torch.nn.Module):
         ### ------------------------------------------------------------------------------------- ###
 
         # Embedding block
-        self.tag_size_atom = tag_size_atom
-        self.tag_use_method = tag_use_method
+        self.enable_tag_embedding = enable_tag_embedding
+        self.atom_tag_combine_method = atom_tag_combine_method
+        atom_emb_size_out = emb_size_atom
+        if self.enable_tag_embedding:
+            atom_emb_size_out += tag_embedding_size
+            self.tag_embedding = TagEmbedding(tag_embedding_size)
 
-        assert self.tag_use_method in ["bilinear", "concat"]
-        if self.tag_use_method == "bilinear":
-            self.atom_emb_bilinear = torch.nn.Bilinear(
-                in1_features=emb_size_atom - tag_size_atom,
-                in2_features=tag_size_atom,
-                out_features=emb_size_atom,
-            )
+            assert self.tag_use_method in {"bilinear", "concat"}
+            if self.tag_use_method == "bilinear":
+                self.atom_emb_bilinear = torch.nn.Bilinear(
+                    in1_features=emb_size_atom,
+                    in2_features=tag_embedding_size,
+                    out_features=atom_emb_size_out,
+                )
 
-        self.atom_emb = AtomEmbedding(emb_size_atom - tag_size_atom)
-
+        self.atom_emb = AtomEmbedding(emb_size_atom)
+        emb_size_atom = atom_emb_size_out
         self.edge_emb = EdgeEmbedding(
             emb_size_atom, num_radial, emb_size_edge, activation=activation
         )
@@ -563,12 +568,13 @@ class GemNetT(torch.nn.Module):
 
         # Embedding block
         h = self.atom_emb(atomic_numbers)
-        if self.tag_size_atom > 0:
-            tags = self._get_tag_features(data.tags)
-            if self.tag_use_method == "bilinear":
-                h = self.atom_emb_bilinear(h, tags)
-            elif self.tag_use_method == "concat":
-                h = torch.cat([h, tags], dim=1)
+        if self.enable_tag_embedding:
+            tag_embeddings = self.tag_embedding(data.tags)
+            if self.atom_tag_combine_method == "bilinear":
+                h = self.atom_emb_bilinear(h, tag_embeddings)
+            elif self.atom_tag_combine_method == "concat":
+                h = torch.cat([h, tag_embeddings], dim=1)
+
         # (nAtoms, emb_size_atom)
         m = self.edge_emb(h, rbf, idx_s, idx_t)  # (nEdges, emb_size_edge)
 

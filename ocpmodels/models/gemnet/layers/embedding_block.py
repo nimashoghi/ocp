@@ -11,6 +11,36 @@ import torch
 from .base_layers import Dense
 
 
+class TagEmbedding(torch.nn.Module):
+    """
+    Initial tag embeddings based on the atom tag (0 = adsobate, 1 = slab, 2 = subsurface)
+
+    Parameters
+    ----------
+        emb_size: int
+            Tag embeddings size
+    """
+
+    def __init__(self, emb_size):
+        super().__init__()
+        self.emb_size = emb_size
+
+        self.embeddings = torch.nn.Embedding(3, emb_size)
+        torch.nn.init.uniform_(
+            self.embeddings.weight, a=-np.sqrt(3), b=np.sqrt(3)
+        )
+
+    def forward(self, tags):
+        """
+        Returns
+        -------
+            h: torch.Tensor, shape=(nAtoms, emb_size)
+                Tag embeddings.
+        """
+        h = self.embeddings(tags)
+        return h
+
+
 class AtomEmbedding(torch.nn.Module):
     """
     Initial atom embeddings based on the atom type
