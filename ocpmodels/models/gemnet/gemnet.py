@@ -214,8 +214,8 @@ class GemNetT(torch.nn.Module):
             atom_emb_size_out += tag_embedding_size
             self.tag_embedding = TagEmbedding(tag_embedding_size)
 
-            assert self.tag_use_method in {"bilinear", "concat"}
-            if self.tag_use_method == "bilinear":
+            assert self.atom_tag_combine_method in {"bilinear", "concat"}
+            if self.atom_tag_combine_method == "bilinear":
                 self.atom_emb_bilinear = torch.nn.Bilinear(
                     in1_features=emb_size_atom,
                     in2_features=tag_embedding_size,
