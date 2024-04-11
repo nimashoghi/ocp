@@ -4,6 +4,7 @@ Copyright (c) Facebook, Inc. and its affiliates.
 This source code is licensed under the MIT license found in the
 LICENSE file in the root directory of this source tree.
 """
+
 import datetime
 import errno
 import logging
@@ -43,6 +44,7 @@ from ocpmodels.modules.normalizer import Normalizer
 from ocpmodels.modules.scaling.compat import load_scales_compat
 from ocpmodels.modules.scaling.util import ensure_fitted
 from ocpmodels.modules.scheduler import LRScheduler
+from ocpmodels.modules.subset import wrap_dataset
 
 
 @registry.register_trainer("base")
@@ -116,9 +118,7 @@ class BaseTrainer(ABC):
                 "checkpoint_dir": os.path.join(
                     run_dir, "checkpoints", self.timestamp_id
                 ),
-                "results_dir": os.path.join(
-                    run_dir, "results", self.timestamp_id
-                ),
+                "results_dir": os.path.join(run_dir, "results", self.timestamp_id),
                 "logs_dir": os.path.join(
                     run_dir, "logs", logger_name, self.timestamp_id
                 ),
@@ -138,9 +138,9 @@ class BaseTrainer(ABC):
                 )
             else:
                 self.config["slurm"]["job_id"] = os.environ["SLURM_JOB_ID"]
-            self.config["slurm"]["folder"] = self.config["slurm"][
-                "folder"
-            ].replace("%j", self.config["slurm"]["job_id"])
+            self.config["slurm"]["folder"] = self.config["slurm"]["folder"].replace(
+                "%j", self.config["slurm"]["job_id"]
+            )
 
         # Define datasets
         if isinstance(dataset, list):
@@ -216,9 +216,7 @@ class BaseTrainer(ABC):
     def load_logger(self) -> None:
         self.logger = None
         if not self.is_debug and distutils.is_master():
-            assert (
-                self.config["logger"] is not None
-            ), "Specify logger in config"
+            assert self.config["logger"] is not None, "Specify logger in config"
 
             logger = self.config["logger"]
             logger_name = logger if isinstance(logger, str) else logger["name"]
@@ -278,9 +276,15 @@ class BaseTrainer(ABC):
                 f"Loading dataset: {self.config['dataset'].get('format', 'lmdb')}"
             )
 
-            self.train_dataset = registry.get_dataset_class(
+            train_dataset = registry.get_dataset_class(
                 self.config["dataset"].get("format", "lmdb")
             )(self.config["dataset"])
+            self.train_dataset = wrap_dataset(
+                self.config,
+                train_dataset,
+                "train",
+                train_dataset=train_dataset,
+            )
             self.train_sampler = self.get_sampler(
                 self.train_dataset,
                 self.config["optim"]["batch_size"],
@@ -298,9 +302,14 @@ class BaseTrainer(ABC):
                 else:
                     val_config = self.config["val_dataset"]
 
-                self.val_dataset = registry.get_dataset_class(
-                    val_config.get("format", "lmdb")
-                )(val_config)
+                self.val_dataset = wrap_dataset(
+                    self.config,
+                    registry.get_dataset_class(val_config.get("format", "lmdb"))(
+                        val_config
+                    ),
+                    "val",
+                    train_dataset=self.train_dataset,
+                )
                 self.val_sampler = self.get_sampler(
                     self.val_dataset,
                     self.config["optim"].get(
@@ -320,9 +329,14 @@ class BaseTrainer(ABC):
                 else:
                     test_config = self.config["test_dataset"]
 
-                self.test_dataset = registry.get_dataset_class(
-                    test_config.get("format", "lmdb")
-                )(test_config)
+                self.test_dataset = wrap_dataset(
+                    self.config,
+                    registry.get_dataset_class(test_config.get("format", "lmdb"))(
+                        test_config
+                    ),
+                    "test",
+                    train_dataset=self.train_dataset,
+                )
                 self.test_sampler = self.get_sampler(
                     self.test_dataset,
                     self.config["optim"].get(
@@ -337,8 +351,13 @@ class BaseTrainer(ABC):
 
         # load relaxation dataset
         if "relax_dataset" in self.config["task"]:
-            self.relax_dataset = registry.get_dataset_class("lmdb")(
-                self.config["task"]["relax_dataset"]
+            self.relax_dataset = wrap_dataset(
+                self.config,
+                registry.get_dataset_class("lmdb")(
+                    self.config["task"]["relax_dataset"]
+                ),
+                "relax",
+                train_dataset=self.train_dataset,
             )
             self.relax_sampler = self.get_sampler(
                 self.relax_dataset,
@@ -354,9 +373,7 @@ class BaseTrainer(ABC):
 
     def load_task(self):
         # Normalizer for the dataset.
-        normalizer = (
-            self.config["dataset"].get("transforms", {}).get("normalizer", {})
-        )
+        normalizer = self.config["dataset"].get("transforms", {}).get("normalizer", {})
         self.normalizers = {}
         if normalizer:
             for target in normalizer:
@@ -367,13 +384,9 @@ class BaseTrainer(ABC):
 
         self.output_targets = {}
         for target_name in self.config["outputs"]:
-            self.output_targets[target_name] = self.config["outputs"][
-                target_name
-            ]
+            self.output_targets[target_name] = self.config["outputs"][target_name]
             if "decomposition" in self.config["outputs"][target_name]:
-                for subtarget in self.config["outputs"][target_name][
-                    "decomposition"
-                ]:
+                for subtarget in self.config["outputs"][target_name]["decomposition"]:
                     self.output_targets[subtarget] = (
                         self.config["outputs"][target_name]["decomposition"]
                     )[subtarget]
@@ -383,23 +396,17 @@ class BaseTrainer(ABC):
                         self.output_targets[subtarget]["level"] = self.config[
                             "outputs"
                         ][target_name].get("level", "system")
-                    if (
-                        "train_on_free_atoms"
-                        not in self.output_targets[subtarget]
-                    ):
-                        self.output_targets[subtarget][
-                            "train_on_free_atoms"
-                        ] = self.config["outputs"][target_name].get(
-                            "train_on_free_atoms", True
+                    if "train_on_free_atoms" not in self.output_targets[subtarget]:
+                        self.output_targets[subtarget]["train_on_free_atoms"] = (
+                            self.config[
+                                "outputs"
+                            ][target_name].get("train_on_free_atoms", True)
                         )
-                    if (
-                        "eval_on_free_atoms"
-                        not in self.output_targets[subtarget]
-                    ):
-                        self.output_targets[subtarget][
-                            "eval_on_free_atoms"
-                        ] = self.config["outputs"][target_name].get(
-                            "eval_on_free_atoms", True
+                    if "eval_on_free_atoms" not in self.output_targets[subtarget]:
+                        self.output_targets[subtarget]["eval_on_free_atoms"] = (
+                            self.config[
+                                "outputs"
+                            ][target_name].get("eval_on_free_atoms", True)
                         )
 
         # TODO: Assert that all targets, loss fn, metrics defined are consistent
@@ -418,9 +425,7 @@ class BaseTrainer(ABC):
 
         # TODO: depreicated, remove.
         bond_feat_dim = None
-        bond_feat_dim = self.config["model_attributes"].get(
-            "num_gaussians", 50
-        )
+        bond_feat_dim = self.config["model_attributes"].get("num_gaussians", 50)
 
         loader = self.train_loader or self.val_loader or self.test_loader
         self.model = registry.get_model_class(self.config["model"])(
@@ -444,9 +449,7 @@ class BaseTrainer(ABC):
             self.logger.watch(self.model)
 
         if distutils.initialized() and not self.config["noddp"]:
-            self.model = DistributedDataParallel(
-                self.model, device_ids=[self.device]
-            )
+            self.model = DistributedDataParallel(self.model, device_ids=[self.device])
 
     @property
     def _unwrapped_model(self):
@@ -455,9 +458,7 @@ class BaseTrainer(ABC):
             module = module.module
         return module
 
-    def load_checkpoint(
-        self, checkpoint_path: str, checkpoint: Dict = {}
-    ) -> None:
+    def load_checkpoint(self, checkpoint_path: str, checkpoint: Dict = {}) -> None:
         if not checkpoint:
             if not os.path.isfile(checkpoint_path):
                 raise FileNotFoundError(
@@ -466,9 +467,7 @@ class BaseTrainer(ABC):
             else:
                 logging.info(f"Loading checkpoint from: {checkpoint_path}")
                 map_location = torch.device("cpu") if self.cpu else self.device
-                checkpoint = torch.load(
-                    checkpoint_path, map_location=map_location
-                )
+                checkpoint = torch.load(checkpoint_path, map_location=map_location)
 
         self.epoch = checkpoint.get("epoch", 0)
         self.step = checkpoint.get("step", 0)
@@ -556,9 +555,7 @@ class BaseTrainer(ABC):
                 )
 
     def load_optimizer(self) -> None:
-        optimizer = getattr(
-            torch.optim, self.config["optim"].get("optimizer", "AdamW")
-        )
+        optimizer = getattr(torch.optim, self.config["optim"].get("optimizer", "AdamW"))
         optimizer_params = self.config["optim"].get("optimizer_params", {})
 
         weight_decay = optimizer_params.get("weight_decay", 0)
@@ -573,9 +570,7 @@ class BaseTrainer(ABC):
         if weight_decay > 0:
             self.model_params_no_wd = {}
             if hasattr(self._unwrapped_model, "no_weight_decay"):
-                self.model_params_no_wd = (
-                    self._unwrapped_model.no_weight_decay()
-                )
+                self.model_params_no_wd = self._unwrapped_model.no_weight_decay()
 
             params_decay, params_no_decay, name_no_decay = [], [], []
             for name, param in self.model.named_parameters():
@@ -583,8 +578,7 @@ class BaseTrainer(ABC):
                     continue
 
                 if any(
-                    name.endswith(skip_name)
-                    for skip_name in self.model_params_no_wd
+                    name.endswith(skip_name) for skip_name in self.model_params_no_wd
                 ):
                     params_no_decay.append(param)
                     name_no_decay.append(name)
@@ -648,9 +642,7 @@ class BaseTrainer(ABC):
                         "config": self.config,
                         "val_metrics": metrics,
                         "ema": self.ema.state_dict() if self.ema else None,
-                        "amp": self.scaler.state_dict()
-                        if self.scaler
-                        else None,
+                        "amp": self.scaler.state_dict() if self.scaler else None,
                         "best_val_metric": self.best_val_metric,
                         "primary_metric": self.evaluation_metrics.get(
                             "primary_metric",
@@ -673,9 +665,7 @@ class BaseTrainer(ABC):
                         },
                         "config": self.config,
                         "val_metrics": metrics,
-                        "amp": self.scaler.state_dict()
-                        if self.scaler
-                        else None,
+                        "amp": self.scaler.state_dict() if self.scaler else None,
                     },
                     checkpoint_dir=self.config["cmd"]["checkpoint_dir"],
                     checkpoint_file=checkpoint_file,
@@ -810,9 +800,7 @@ class BaseTrainer(ABC):
                 max_norm=self.clip_grad_norm,
             )
             if self.logger is not None:
-                self.logger.log(
-                    {"grad_norm": grad_norm}, step=self.step, split="train"
-                )
+                self.logger.log({"grad_norm": grad_norm}, step=self.step, split="train")
         if self.scaler:
             self.scaler.step(self.optimizer)
             self.scaler.update()
@@ -821,9 +809,7 @@ class BaseTrainer(ABC):
         if self.ema:
             self.ema.update()
 
-    def save_results(
-        self, predictions, results_file: Optional[str], keys=None
-    ) -> None:
+    def save_results(self, predictions, results_file: Optional[str], keys=None) -> None:
         if results_file is None:
             return
         if keys is None:
@@ -840,9 +826,7 @@ class BaseTrainer(ABC):
 
         distutils.synchronize()
         if distutils.is_master():
-            gather_results: DefaultDict[
-                str, npt.NDArray[np.float_]
-            ] = defaultdict(list)
+            gather_results: DefaultDict[str, npt.NDArray[np.float_]] = defaultdict(list)
             full_path = os.path.join(
                 self.config["cmd"]["results_dir"],
                 f"{self.name}_{results_file}.npz",
