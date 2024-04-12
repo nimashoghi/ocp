@@ -31,6 +31,7 @@ from ocpmodels.models.scn.smearing import (
     SiLUSmearing,
 )
 
+from ..rhescnv10.util import tassert
 from .ckptutil import filter_ckpt
 from .radius_graph_utils import generate_graph
 from .rhomboidal import compute_idx_and_mask, signidx
@@ -42,7 +43,7 @@ from .so3 import (
     fused_s2_pointwise_nonlinearity_and_rotate_inv_combined_unoptimized,
 )
 from .sphharm import spherical_harmonics
-from .util import rearrange_view, tassert
+from .util import rearrange_view
 from .wigner_efficient import (
     JdPrecomputed_Optimized,
     Rhomboidal_SO3_Rotation_Parallel_FastMM,
@@ -57,6 +58,8 @@ GridType = Rhomboidal_SO3_Grid_Optimized
 JdpType = JdPrecomputed_Optimized
 RotType = Rhomboidal_SO3_Rotation_Parallel_FastMM
 
+
+OPTIMIZE = True
 
 try:
     from e3nn import o3
@@ -196,7 +199,7 @@ def _opt_einsum():
         pass
 
 
-@registry.register_model("rhescn")
+@registry.register_model("rhescnv8clean")
 class RHESCN(BaseModel):
     sphere_points: Float[torch.Tensor, "P 3"]
     sphharm_weights: Float[torch.Tensor, "P l_sq"]
@@ -422,20 +425,19 @@ class RHESCN(BaseModel):
     # @conditional_grad(torch.enable_grad())
     def forward(
         self,
-        # pos: torch.Tensor,
-        # atomic_numbers: torch.Tensor,
-        # # cell: torch.Tensor,
-        # edge_index: torch.Tensor,
-        # edge_distance: torch.Tensor,
-        # edge_distance_vec: torch.Tensor,
-        # batch: torch.Tensor,
-        # natoms: torch.Tensor,
-        batch,
+        pos: torch.Tensor,
+        atomic_numbers: torch.Tensor,
+        # cell: torch.Tensor,
+        edge_index: torch.Tensor,
+        edge_distance: torch.Tensor,
+        edge_distance_vec: torch.Tensor,
+        batch: torch.Tensor,
+        natoms: torch.Tensor,
     ):
         # def forward(self, batch):
-        if True:
+        if False:
             pos = batch.pos
-            atomic_numbers = batch.atomic_numbers.long()
+            atomic_numbers = batch.atomic_numbers
             cell = batch.cell
             natoms = batch.natoms
             # edge_index = batch.edge_index
@@ -502,6 +504,7 @@ class RHESCN(BaseModel):
                 self.mmax_list[0],
                 self.rh_idx,
                 # self.rh_mask,
+                masker=self.masker,
                 keep_full_wigner=False,
                 keep_full_wigner_inv=True,
                 use_rotmat=True,
@@ -710,7 +713,13 @@ class LayerBlock(torch.nn.Module):
             ActSave.context("pointwise_grid_conv"),
         ):
             ActSave({"x_message": x_message})
-            if False:
+            if OPTIMIZE:
+                ActSave(
+                    {
+                        "to_grid_sh_tri": self.conv_rh_grid.to_grid_sh_tri,
+                        "from_grid_sh_tri": self.conv_rh_grid.from_grid_sh_tri,
+                    }
+                )
                 x_message = fused_s2_pointwise_conv_optimized(
                     x,
                     x_message,
@@ -719,6 +728,7 @@ class LayerBlock(torch.nn.Module):
                     self.fc1_sphere.weight,
                     self.fc2_sphere.weight,
                     self.fc3_sphere.weight,
+                    self.masker,
                 )
             else:
                 ActSave(
@@ -928,7 +938,7 @@ class MessageBlock(torch.nn.Module):
             ActSave({"x_updated": x})
 
             # assert x.dtype == torch.float16
-            if False:
+            if OPTIMIZE:
                 x = fused_s2_pointwise_nonlinearity_and_rotate_inv_combined_optimized(
                     x,
                     self.rh_grid.to_grid_sh_rh,

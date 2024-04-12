@@ -18,6 +18,7 @@ from jaxtyping import Float
 from ll import ActSave
 
 from .rhomboidal import Normalization, compute_idx_and_mask
+from .util import rearrange_view
 
 if TYPE_CHECKING:
     from .model import Masker
@@ -25,21 +26,26 @@ if TYPE_CHECKING:
 log = getLogger(__name__)
 
 
-@torch.jit.script
+# @torch.jit.script
 def fused_s2_pointwise_nonlinearity_and_rotate_inv_combined_optimized(
     x: torch.Tensor,  # E (m 2 l) C
     to_grid_sh_rh: torch.Tensor,  # (res_beta res_alpha) (m 2 l)
     wigner_inv_from_grid: torch.Tensor,  # E (res_beta res_alpha) l_sq
 ):
-    # x = torch.tensordot(x, to_grid_sh_rh, dims=((1, 3, 2), (2, 4, 3)))
-    # x = F.silu(x)
-    # x = torch.bmm(x.view(x.shape[0], x.shape[1], -1), wigner_inv_from_grid)
-    # x = x.transpose(-1, -2)
-    # return x
-    x = torch.bmm(to_grid_sh_rh[None].expand(x.shape[0], -1, -1), x)
-    x = F.silu(x)
-    x = torch.bmm(wigner_inv_from_grid, x)
-    return x
+    with ActSave.context("act_rotate_inv"):
+        # x = torch.tensordot(x, to_grid_sh_rh, dims=((1, 3, 2), (2, 4, 3)))
+        # x = F.silu(x)
+        # x = torch.bmm(x.view(x.shape[0], x.shape[1], -1), wigner_inv_from_grid)
+        # x = x.transpose(-1, -2)
+        # return x
+        x = torch.bmm(to_grid_sh_rh[None].expand(x.shape[0], -1, -1), x)
+        ActSave({"x_grid": x})
+        x = F.silu(x)
+        ActSave({"x_grid_silu": x})
+
+        x = torch.bmm(wigner_inv_from_grid, x)
+        ActSave({"x_sphere_rotated": x})
+        return x
 
 
 def fused_s2_pointwise_nonlinearity_and_rotate_inv_combined_unoptimized(
@@ -74,7 +80,7 @@ def fused_s2_pointwise_nonlinearity_and_rotate_inv_combined_unoptimized(
         return x
 
 
-@torch.jit.script
+# @torch.jit.script
 def fused_s2_pointwise_conv_optimized(
     x: torch.Tensor,  # N l_sq C,
     x_message: torch.Tensor,  # N l_sq C,
@@ -83,28 +89,41 @@ def fused_s2_pointwise_conv_optimized(
     fc1_sphere_weight: torch.Tensor,  # 2*C C
     fc2_sphere_weight: torch.Tensor,  # C C
     fc3_sphere_weight: torch.Tensor,  # C C
+    masker: "Masker",
 ):
-    x = torch.cat((x, x_message), dim=-1)
-    # ^ Shape: N l_sq 2C
+    with ActSave.context("s2_conv"):
+        # Project to the grid
+        to_grid_sh_tri = masker(to_grid_sh_tri, dim=1, with_mmax=False)
+        from_grid_sh_tri = masker(from_grid_sh_tri, dim=0, with_mmax=False)
 
-    # Project to the grid
-    # x = torch.einsum("bai,eic->ebac", to_grid_sh_tri, x)
-    # # ^ Shape: N res_beta res_alpha 2C
-    x = torch.bmm(to_grid_sh_tri[None].expand(x.shape[0], -1, -1), x)
-    # ^ Shape: N res_beta*res_alpha 2C
+        x = torch.cat((x, x_message), dim=-1)
+        # ^ Shape: N l_sq 2C
 
-    # Conv
-    x = F.silu(F.linear(x, fc1_sphere_weight))
-    x = F.silu(F.linear(x, fc2_sphere_weight))
-    x = F.linear(x, fc3_sphere_weight)
+        # Project to the grid
+        # x = torch.einsum("bai,eic->ebac", to_grid_sh_tri, x)
+        # # ^ Shape: N res_beta res_alpha 2C
+        x = torch.bmm(to_grid_sh_tri[None].expand(x.shape[0], -1, -1), x)
+        # ^ Shape: N res_beta*res_alpha 2C
+        ActSave({"x_cat": x})
 
-    # Project back to the coefficients
-    # x = torch.einsum("bai,ebac->eic", from_grid_sh_tri, x)
-    # # ^ Shape: N l_sq C
-    x = torch.bmm(from_grid_sh_tri[None].expand(x.shape[0], -1, -1), x)
-    # ^ Shape: N l_sq C
+        x_grid, x_message_grid = torch.split(x, x.shape[-1] // 2, dim=-1)
+        ActSave({"x_grid": x_grid, "x_message_grid": x_message_grid})
+        del x_grid, x_message_grid
 
-    return x
+        # Conv
+        x = F.silu(F.linear(x, fc1_sphere_weight))
+        x = F.silu(F.linear(x, fc2_sphere_weight))
+        x = F.linear(x, fc3_sphere_weight)
+        ActSave({"x_grid_conv": x})
+
+        # Project back to the coefficients
+        # x = torch.einsum("bai,ebac->eic", from_grid_sh_tri, x)
+        # # ^ Shape: N l_sq C
+        x = torch.bmm(from_grid_sh_tri[None].expand(x.shape[0], -1, -1), x)
+        # ^ Shape: N l_sq C
+        ActSave({"x_message": x})
+
+        return x
 
 
 def fused_s2_pointwise_conv_unoptimized(

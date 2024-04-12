@@ -1,6 +1,5 @@
-from dataclasses import dataclass
 from logging import getLogger
-from typing import List, NamedTuple, Optional
+from typing import TYPE_CHECKING, List, NamedTuple, Optional
 
 import torch
 import torch.nn as nn
@@ -14,6 +13,9 @@ from typing_extensions import override
 from ocpmodels.modules import profiler as P
 
 from .jd_precomputed import Jd as _Jd
+
+if TYPE_CHECKING:
+    from .model import Masker
 
 log = getLogger(__name__)
 
@@ -477,6 +479,8 @@ def rot_from_xyz(
     device: torch.device | None = None,
     dtype: torch.dtype | None = None,
     vectorize: bool = False,
+    *,
+    masker: "Masker",
 ):
     device = xyz.device if device is None else device
     dtype = xyz.dtype if dtype is None else dtype
@@ -538,8 +542,13 @@ def rot_from_xyz(
         # wigner_inv_from_grid = torch.einsum(
         #     "eij,ig->ejg", full_wigner, from_grid_sh_tri
         # )
+
+        wigner_inv_full = full_wigner.transpose(-1, -2)
+        wigner_inv_full = masker(wigner_inv_full, dim=1, with_mmax=False)
+        wigner_inv_full = masker(wigner_inv_full, dim=2, with_mmax=True)
+
         wigner_inv_from_grid = torch.bmm(
-            full_wigner.transpose(-1, -2),
+            wigner_inv_full,
             from_grid_sh_tri[None].expand(full_wigner.shape[0], -1, -1),
         )
 
@@ -554,7 +563,7 @@ def rot_from_xyz(
         wigner_inv,
         wigner_inv_from_grid,
         full_wigner=full_wigner if keep_full_wigner else None,
-        full_wigner_inv=full_wigner.transpose(-1, -2) if keep_full_wigner_inv else None,
+        full_wigner_inv=wigner_inv_full if keep_full_wigner_inv else None,
         rotmat=rot_mat if keep_rot_mat else None,
         # rh_idx=rh_idx,
         # rh_mask=rh_mask,
