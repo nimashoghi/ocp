@@ -89,13 +89,9 @@ def fused_s2_pointwise_conv_optimized(
     fc1_sphere_weight: torch.Tensor,  # 2*C C
     fc2_sphere_weight: torch.Tensor,  # C C
     fc3_sphere_weight: torch.Tensor,  # C C
-    masker: "Masker",
 ):
     with ActSave.context("s2_conv"):
         # Project to the grid
-        to_grid_sh_tri = masker(to_grid_sh_tri, dim=1, with_mmax=False)
-        from_grid_sh_tri = masker(from_grid_sh_tri, dim=0, with_mmax=False)
-
         x = torch.cat((x, x_message), dim=-1)
         # ^ Shape: N l_sq 2C
 
@@ -236,6 +232,7 @@ class Rhomboidal_SO3_Grid_Optimized(nn.Module):
     def __init__(
         self,
         mmax: int,
+        masker: "Masker",
         res: Optional[Tuple[int, int]] = None,
         normalization: Normalization = "integral",
         grid_fp16: bool = False,
@@ -289,6 +286,10 @@ class Rhomboidal_SO3_Grid_Optimized(nn.Module):
             from_grid_sh_tri,
             "res_beta res_alpha l_sq -> l_sq (res_beta res_alpha)",
         ).contiguous()
+
+        # ESCN compat masking
+        to_grid_sh_tri = masker(to_grid_sh_tri, dim=1, with_mmax=False)
+        from_grid_sh_tri = masker(from_grid_sh_tri, dim=0, with_mmax=False)
 
         self.register_buffer("to_grid_sh_tri", to_grid_sh_tri, persistent=False)
         self.register_buffer("from_grid_sh_tri", from_grid_sh_tri, persistent=False)

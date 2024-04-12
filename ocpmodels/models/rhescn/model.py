@@ -338,6 +338,7 @@ class RHESCN(BaseModel):
                 self.num_gaussians,
                 basis_width_scalar,
             )
+        self.masker = Masker(x_message_lmax, x_message_mmax)
 
         # Initialize the transformations between spherical and grid representations
         # self.SO3_grid = nn.ModuleList()
@@ -349,16 +350,22 @@ class RHESCN(BaseModel):
         #     self.SO3_grid.append(SO3_m_grid)
 
         # self.SO3_grid = SO3_Grid(self.lmax_list[0], self.lmax_list[0])
-        self.rh_grid = GridType(self.mmax_list[0], grid_fp16=grid_fp16, res=grid_res)
+        self.rh_grid = GridType(
+            self.mmax_list[0],
+            self.masker,
+            grid_fp16=grid_fp16,
+            res=grid_res,
+        )
 
         if conv_grid_res is not None:
             conv_rh_grid = GridType(
-                self.mmax_list[0], grid_fp16=grid_fp16, res=conv_grid_res
+                self.mmax_list[0],
+                self.masker,
+                grid_fp16=grid_fp16,
+                res=conv_grid_res,
             )
         else:
             conv_rh_grid = self.rh_grid
-
-        self.masker = Masker(x_message_lmax, x_message_mmax)
 
         # Initialize the blocks for each layer of the GNN
         self.layer_blocks = nn.ModuleList()
@@ -728,7 +735,6 @@ class LayerBlock(torch.nn.Module):
                     self.fc1_sphere.weight,
                     self.fc2_sphere.weight,
                     self.fc3_sphere.weight,
-                    self.masker,
                 )
             else:
                 ActSave(
