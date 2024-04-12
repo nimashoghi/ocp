@@ -6,15 +6,16 @@ LICENSE file in the root directory of this source tree.
 """
 
 import logging
+import sys
 import time
+from collections.abc import Mapping
 from typing import List
 
-import lovely_tensors as lt
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from einops import pack, rearrange, repeat
+from einops import rearrange
 from jaxtyping import Float, Int
 from ll import ActSave
 from torch.autograd import profiler as P
@@ -31,126 +32,22 @@ from ocpmodels.models.scn.smearing import (
     SiLUSmearing,
 )
 
-from ..rhescnv10.util import tassert
-from .ckptutil import filter_ckpt
+from . import ops
+from .escn_compat import escn_compat_apply_tri_mask, eSCNCompatConfig
+from .grid import RhomboidalS2Grid
+from .precomputes import RhomboidalPrecomputes
 from .radius_graph_utils import generate_graph
-from .rhomboidal import compute_idx_and_mask, signidx
-from .so3 import (
-    Rhomboidal_SO3_Grid_Optimized,
-    fused_s2_pointwise_conv_optimized,
-    fused_s2_pointwise_conv_unoptimized,
-    fused_s2_pointwise_nonlinearity_and_rotate_inv_combined_optimized,
-    fused_s2_pointwise_nonlinearity_and_rotate_inv_combined_unoptimized,
-)
+from .rhomboidal import signidx
+from .rotation import ComputedWignerMatrices, rot_from_xyz
 from .sphharm import spherical_harmonics
-from .util import rearrange_view
-from .wigner_efficient import (
-    JdPrecomputed_Optimized,
-    Rhomboidal_SO3_Rotation_Parallel_FastMM,
-    rot_from_xyz,
-)
-
-lt.monkey_patch()
-# from ocpmodels.modules.profiler import active_profiler
+from .util import rearrange_view, tassert
 
 
-GridType = Rhomboidal_SO3_Grid_Optimized
-JdpType = JdPrecomputed_Optimized
-RotType = Rhomboidal_SO3_Rotation_Parallel_FastMM
+def _filter_ckpt(state_dict: Mapping[str, torch.Tensor], prefix: str):
+    return {k[len(prefix) :]: v for k, v in state_dict.items() if k.startswith(prefix)}
 
 
 OPTIMIZE = True
-
-try:
-    from e3nn import o3
-except ImportError:
-    pass
-
-
-class Masker:
-    def __init__(
-        self,
-        lmax: int | None,
-        mmax: int | None,
-    ):
-        self.lmax = lmax
-        self.mmax = mmax
-
-    def rh(
-        self,
-        x: torch.Tensor,
-        dim: int = 1,
-        reshape: bool = True,
-    ):
-        if reshape:
-            m = int((x.shape[dim] // 2) ** 0.5)
-            x = rearrange_view(
-                x, "E (m two_sign l) C -> E m two_sign l C", m=m, two_sign=2, l=m
-            )
-        if self.mmax is None or self.mmax > x.shape[dim]:
-            if reshape:
-                x = rearrange_view(x, "E m two_sign l C -> E (m two_sign l) C")
-            return x
-
-        idx = ()
-        for i in range(dim):
-            idx += (slice(None),)
-
-        idx_to_keep = idx + (slice(self.mmax),)
-        idx_to_zero = idx + (slice(self.mmax, None),)
-
-        x = torch.cat([x[idx_to_keep], torch.zeros_like(x[idx_to_zero])], dim=dim)
-        if reshape:
-            x = rearrange_view(x, "E m two_sign l C -> E (m two_sign l) C")
-        return x
-
-    def __call__(
-        self,
-        x: torch.Tensor,
-        dim: int = 1,
-        with_mmax: bool = False,
-    ):
-        if self.lmax is None:
-            return x
-        count = (self.lmax + 1) ** 2
-
-        idx = ()
-        for i in range(dim):
-            idx += (slice(None),)
-
-        idx_to_keep = idx + (slice(count),)
-        idx_to_zero = idx + (slice(count, None),)
-
-        x = torch.cat([x[idx_to_keep], torch.zeros_like(x[idx_to_zero])], dim=dim)
-
-        if with_mmax:
-            x = self.tri_mmax(x, dim=dim)
-        return x
-
-    def tri_mmax(self, x: torch.Tensor, dim: int = 1):
-        if self.mmax is None:
-            return x
-
-        # X is shape (E, (lmax+1)^2, C)
-        # Let's get the lmax
-        lmax = int((x.shape[dim]) ** 0.5) - 1
-
-        i = 0
-        mask = torch.ones((x.shape[dim]), dtype=torch.bool, device=x.device)
-        for l in range(lmax + 1):
-            for m in range(-l, l + 1):
-                if abs(m) > self.mmax:
-                    mask[i] = False
-                i += 1
-
-        #  Add Nones to the mask to make it the right shape
-        for _ in range(dim):
-            mask = mask.unsqueeze(0)
-        for _ in range(dim + 1, x.dim()):
-            mask = mask.unsqueeze(-1)
-
-        x = x * mask
-        return x
 
 
 class M0L0Embedding(nn.Module):
@@ -199,13 +96,10 @@ def _opt_einsum():
         pass
 
 
-@registry.register_model("rhescnv8clean")
+@registry.register_model("rhescn")
 class RHESCN(BaseModel):
     sphere_points: Float[torch.Tensor, "P 3"]
     sphharm_weights: Float[torch.Tensor, "P l_sq"]
-
-    rh_idx: torch.Tensor
-    # rh_mask: torch.Tensor
 
     def __init__(
         self,
@@ -245,8 +139,6 @@ class RHESCN(BaseModel):
         if opt_einsum:
             _opt_einsum()
 
-        import sys
-
         if "e3nn" not in sys.modules:
             logging.error("You need to install the e3nn library to use the SCN model")
             raise ImportError
@@ -273,8 +165,18 @@ class RHESCN(BaseModel):
         self.distance_function = distance_function
         self.wigner_fp16 = wigner_fp16
         self.opt_wigner = opt_wigner
+        self.escn_compat_config = (
+            eSCNCompatConfig(lmax=x_message_lmax, mmax=x_message_mmax)
+            if (x_message_lmax is not None or x_message_mmax is not None)
+            else None
+        )
 
-        self.jdp = JdpType(self.lmax_list[0], wigner_fp16=self.wigner_fp16)
+        self.precomputes = RhomboidalPrecomputes(
+            self.lmax_list[0],
+            self.mmax_list[0],
+            wigner_fp16=self.wigner_fp16,
+        )
+        # self.jdp = JdPrecomputed(self.lmax_list[0], wigner_fp16=self.wigner_fp16)
 
         assert self.num_resolutions == 1, "Only one resolution is currently supported"
         assert len(self.mmax_list) == 1, "Only one resolution is currently supported"
@@ -285,14 +187,6 @@ class RHESCN(BaseModel):
 
         # variables used for display purposes
         # self.counter = 0
-
-        # Set up rhomboidal idx/mask
-        # idx, mask = compute_idx_and_mask(self.mmax_list[0])
-        # self.register_buffer("rh_idx", idx, persistent=False)
-        # self.register_buffer("rh_mask", mask, persistent=False)
-        idx, _ = compute_idx_and_mask(self.mmax_list[0])
-        self.register_buffer("rh_idx", idx, persistent=False)
-        # self.register_buffer("rh_mask", mask, persistent=False)
 
         # non-linear activation function used throughout the network
         self.act = nn.SiLU()
@@ -338,7 +232,6 @@ class RHESCN(BaseModel):
                 self.num_gaussians,
                 basis_width_scalar,
             )
-        self.masker = Masker(x_message_lmax, x_message_mmax)
 
         # Initialize the transformations between spherical and grid representations
         # self.SO3_grid = nn.ModuleList()
@@ -350,17 +243,17 @@ class RHESCN(BaseModel):
         #     self.SO3_grid.append(SO3_m_grid)
 
         # self.SO3_grid = SO3_Grid(self.lmax_list[0], self.lmax_list[0])
-        self.rh_grid = GridType(
+        self.rh_grid = RhomboidalS2Grid(
             self.mmax_list[0],
-            self.masker,
+            self.escn_compat_config,
             grid_fp16=grid_fp16,
             res=grid_res,
         )
 
         if conv_grid_res is not None:
-            conv_rh_grid = GridType(
+            conv_rh_grid = RhomboidalS2Grid(
                 self.mmax_list[0],
-                self.masker,
+                self.escn_compat_config,
                 grid_fp16=grid_fp16,
                 res=conv_grid_res,
             )
@@ -383,7 +276,7 @@ class RHESCN(BaseModel):
                 self.rh_grid,
                 self.act,
                 conv_rh_grid=conv_rh_grid,
-                masker=self.masker,
+                escn_compat_config=self.escn_compat_config,
             )
             self.layer_blocks.append(block)
 
@@ -407,68 +300,56 @@ class RHESCN(BaseModel):
         if load_from_ckpt:
             ckpt = torch.load(load_from_ckpt, map_location="cpu")
             self.load_from_escn_state_dict(
-                filter_ckpt(ckpt["state_dict"], "module.module.")
+                _filter_ckpt(ckpt["state_dict"], "module.module.")
             )
 
     def load_from_escn_state_dict(self, state_dict: dict[str, torch.Tensor]):
         self.sphere_embedding.embedding.load_state_dict(
-            filter_ckpt(state_dict, "sphere_embedding.")
+            _filter_ckpt(state_dict, "sphere_embedding.")
         )
         self.distance_expansion.load_state_dict(
-            filter_ckpt(state_dict, "distance_expansion.")
+            _filter_ckpt(state_dict, "distance_expansion.")
         )
         self.energy_block.load_from_escn_state_dict(
-            filter_ckpt(state_dict, "energy_block.")
+            _filter_ckpt(state_dict, "energy_block.")
         )
         self.force_block.load_from_escn_state_dict(
-            filter_ckpt(state_dict, "force_block.")
+            _filter_ckpt(state_dict, "force_block.")
         )
 
         for i, block in enumerate(self.layer_blocks):
             block.load_from_escn_state_dict(
-                filter_ckpt(state_dict, f"layer_blocks.{i}.")
+                _filter_ckpt(state_dict, f"layer_blocks.{i}.")
             )
 
     # @conditional_grad(torch.enable_grad())
-    def forward(
-        self,
-        pos: torch.Tensor,
-        atomic_numbers: torch.Tensor,
-        # cell: torch.Tensor,
-        edge_index: torch.Tensor,
-        edge_distance: torch.Tensor,
-        edge_distance_vec: torch.Tensor,
-        batch: torch.Tensor,
-        natoms: torch.Tensor,
-    ):
-        # def forward(self, batch):
-        if False:
-            pos = batch.pos
-            atomic_numbers = batch.atomic_numbers
-            cell = batch.cell
-            natoms = batch.natoms
-            # edge_index = batch.edge_index
-            # edge_distance = batch.edge_distance
-            # edge_distance_vec = batch.edge_distance_vec
-            batch = batch.batch
+    def forward(self, batch):
+        pos = batch.pos
+        atomic_numbers = batch.atomic_numbers.long()
+        cell = batch.cell
+        natoms = batch.natoms
+        # edge_index = batch.edge_index
+        # edge_distance = batch.edge_distance
+        # edge_distance_vec = batch.edge_distance_vec
+        batch = batch.batch
 
-            (
-                edge_index,
-                edge_distance,
-                edge_distance_vec,
-                cell_offsets,
-                _,  # cell offset distances
-                neighbors,
-            ) = generate_graph(
-                pos,
-                cell,
-                batch,
-                natoms,
-                cutoff=self.cutoff,
-                max_neighbors=self.max_neighbors,
-                use_pbc=self.use_pbc,
-                otf_graph=self.otf_graph,
-            )
+        (
+            edge_index,
+            edge_distance,
+            edge_distance_vec,
+            cell_offsets,
+            _,  # cell offset distances
+            neighbors,
+        ) = generate_graph(
+            pos,
+            cell,
+            batch,
+            natoms,
+            cutoff=self.cutoff,
+            max_neighbors=self.max_neighbors,
+            use_pbc=self.use_pbc,
+            otf_graph=self.otf_graph,
+        )
 
         device = pos.device
         self.batch_size = natoms.shape[0]
@@ -506,28 +387,14 @@ class RHESCN(BaseModel):
         with P.record_function("precompute_wigner"):
             wigner_precomp = rot_from_xyz(
                 edge_distance_vec,
-                self.rh_grid.from_grid_sh_tri,
-                self.jdp,
-                self.mmax_list[0],
-                self.rh_idx,
-                # self.rh_mask,
-                masker=self.masker,
-                keep_full_wigner=False,
-                keep_full_wigner_inv=True,
-                use_rotmat=True,
+                mmax=self.mmax_list[0],
+                from_grid_sh_tri=self.rh_grid.from_grid_sh_tri,
+                precomputes=self.precomputes,
+                rh_idx=self.precomputes.rh_idx,
+                escn_compat_config=self.escn_compat_config,
                 device=device,
                 dtype=dtype,
             )
-
-            # wigner_precomp = wigner_precomp._replace(
-            #     wigner=self.masker(wigner_precomp.wigner, dim=2)
-            # )
-            # if wigner_precomp.full_wigner_inv is not None:
-            #     wigner_precomp = wigner_precomp._replace(
-            #         full_wigner_inv=self.masker(
-            #             self.masker(wigner_precomp.full_wigner_inv, dim=1), dim=2
-            #         )
-            #     )
 
         ###############################################################
         # Initialize node embeddings
@@ -552,7 +419,7 @@ class RHESCN(BaseModel):
                     wigner_precomp,
                 )
 
-        x = self.masker(x, dim=1)
+        x = escn_compat_apply_tri_mask(self.escn_compat_config, x, dim=1)
 
         # Sample the spherical channels (node embeddings) at evenly distributed points on the sphere.
         # These values are fed into the output blocks.
@@ -634,10 +501,10 @@ class LayerBlock(torch.nn.Module):
         distance_expansion,
         max_num_elements: int,
         # SO3_grid: SO3_Grid,
-        rh_grid: GridType,
+        rh_grid: RhomboidalS2Grid,
         act,
-        masker: Masker,
-        conv_rh_grid: GridType | None = None,
+        escn_compat_config: eSCNCompatConfig | None = None,
+        conv_rh_grid: RhomboidalS2Grid | None = None,
     ) -> None:
         super(LayerBlock, self).__init__()
         self.layer_idx = layer_idx
@@ -649,7 +516,7 @@ class LayerBlock(torch.nn.Module):
         self.sphere_channels_all = self.num_resolutions * self.sphere_channels
         # self.SO3_grid = SO3_grid
         self.rh_grid = rh_grid
-        self.masker = masker
+        self.escn_compat_config = escn_compat_config
 
         if conv_rh_grid is None:
             conv_rh_grid = rh_grid
@@ -668,7 +535,7 @@ class LayerBlock(torch.nn.Module):
             # self.SO3_grid,
             rh_grid,
             self.act,
-            self.masker,
+            self.escn_compat_config,
         )
 
         # Non-linear point-wise comvolution for the aggregated messages
@@ -685,11 +552,11 @@ class LayerBlock(torch.nn.Module):
         )
 
     def load_from_escn_state_dict(self, state_dict: dict[str, torch.Tensor]):
-        self.fc1_sphere.load_state_dict(filter_ckpt(state_dict, "fc1_sphere."))
-        self.fc2_sphere.load_state_dict(filter_ckpt(state_dict, "fc2_sphere."))
-        self.fc3_sphere.load_state_dict(filter_ckpt(state_dict, "fc3_sphere."))
+        self.fc1_sphere.load_state_dict(_filter_ckpt(state_dict, "fc1_sphere."))
+        self.fc2_sphere.load_state_dict(_filter_ckpt(state_dict, "fc2_sphere."))
+        self.fc3_sphere.load_state_dict(_filter_ckpt(state_dict, "fc3_sphere."))
         self.message_block.load_from_escn_state_dict(
-            filter_ckpt(state_dict, "message_block.")
+            _filter_ckpt(state_dict, "message_block.")
         )
 
     def forward(
@@ -713,46 +580,30 @@ class LayerBlock(torch.nn.Module):
         )
         ActSave({"x_message": x_message})
 
-        x_message = self.masker(x_message, dim=1)
+        x_message = escn_compat_apply_tri_mask(
+            self.escn_compat_config, x_message, dim=1
+        )
 
         with (
             P.record_function("pointwise_grid_conv"),
             ActSave.context("pointwise_grid_conv"),
         ):
             ActSave({"x_message": x_message})
-            if OPTIMIZE:
-                ActSave(
-                    {
-                        "to_grid_sh_tri": self.conv_rh_grid.to_grid_sh_tri,
-                        "from_grid_sh_tri": self.conv_rh_grid.from_grid_sh_tri,
-                    }
-                )
-                x_message = fused_s2_pointwise_conv_optimized(
-                    x,
-                    x_message,
-                    self.conv_rh_grid.to_grid_sh_tri,
-                    self.conv_rh_grid.from_grid_sh_tri,
-                    self.fc1_sphere.weight,
-                    self.fc2_sphere.weight,
-                    self.fc3_sphere.weight,
-                )
-            else:
-                ActSave(
-                    {
-                        "to_grid_sh_tri": self.conv_rh_grid.to_grid_sh_tri,
-                        "from_grid_sh_tri": self.conv_rh_grid.from_grid_sh_tri,
-                    }
-                )
-                x_message = fused_s2_pointwise_conv_unoptimized(
-                    x,
-                    x_message,
-                    self.conv_rh_grid.to_grid_sh_tri,
-                    self.conv_rh_grid.from_grid_sh_tri,
-                    self.fc1_sphere.weight,
-                    self.fc2_sphere.weight,
-                    self.fc3_sphere.weight,
-                    self.masker,
-                )
+            ActSave(
+                {
+                    "to_grid_sh_tri": self.conv_rh_grid.to_grid_sh_tri,
+                    "from_grid_sh_tri": self.conv_rh_grid.from_grid_sh_tri,
+                }
+            )
+            x_message = ops.fused_s2_pointwise_conv(
+                x,
+                x_message,
+                self.conv_rh_grid.to_grid_sh_tri,
+                self.conv_rh_grid.from_grid_sh_tri,
+                self.fc1_sphere.weight,
+                self.fc2_sphere.weight,
+                self.fc3_sphere.weight,
+            )
             ActSave({"x_message_updated": x_message})
 
         # Return aggregated messages
@@ -787,9 +638,9 @@ class MessageBlock(torch.nn.Module):
         distance_expansion,
         max_num_elements: int,
         # SO3_grid: SO3_Grid,
-        rh_grid: GridType,
+        rh_grid: RhomboidalS2Grid,
         act,
-        masker: Masker,
+        escn_compat_config: eSCNCompatConfig | None = None,
     ) -> None:
         super(MessageBlock, self).__init__()
         self.layer_idx = layer_idx
@@ -802,7 +653,7 @@ class MessageBlock(torch.nn.Module):
         self.lmax_list = lmax_list
         self.mmax_list = mmax_list
         self.edge_channels = edge_channels
-        self.masker = masker
+        self.escn_compat_config = escn_compat_config
 
         # Create edge scalar (invariant to rotations) features
         self.edge_block = EdgeBlock(
@@ -830,13 +681,13 @@ class MessageBlock(torch.nn.Module):
 
     def load_from_escn_state_dict(self, state_dict: dict[str, torch.Tensor]):
         self.edge_block.load_from_escn_state_dict(
-            filter_ckpt(state_dict, "edge_block.")
+            _filter_ckpt(state_dict, "edge_block.")
         )
         self.so2_block_source.load_from_escn_state_dict(
-            filter_ckpt(state_dict, "so2_block_source.")
+            _filter_ckpt(state_dict, "so2_block_source.")
         )
         self.so2_block_target.load_from_escn_state_dict(
-            filter_ckpt(state_dict, "so2_block_target.")
+            _filter_ckpt(state_dict, "so2_block_target.")
         )
 
     def forward(
@@ -845,7 +696,7 @@ class MessageBlock(torch.nn.Module):
         atomic_numbers: Int[torch.Tensor, "N"],
         edge_distance: Float[torch.Tensor, "E"],
         edge_index: Int[torch.Tensor, "2 E"],
-        SO3_edge_rot: "RotType",
+        SO3_edge_rot: ComputedWignerMatrices,
         # mappingReduced,
     ):
         idx_s, idx_t = edge_index
@@ -899,30 +750,6 @@ class MessageBlock(torch.nn.Module):
                     l=self.mmax_list[0] + 1,
                 )
                 ActSave({"x_target_rot": x_target})
-            if False:
-                with P.record_function("rotate"):
-                    x = rearrange_view(
-                        x, "two_st E l_sq C -> (two_st E) l_sq C", two_st=2
-                    )
-                    x = torch.bmm(
-                        repeat(
-                            SO3_edge_rot.full_wigner,
-                            "E ... -> (two_st E) ...",
-                            two_st=2,
-                        ),
-                        x,
-                    )
-                    # ^ Shape: 2 E l_sq C
-
-                    x = x[:, SO3_edge_rot.rh_idx.view(-1)]
-                    x = rearrange_view(
-                        x,
-                        "(two_st E) (m two_sign l) C -> two_st E m two_sign l C",
-                        two_st=2,
-                        m=self.mmax_list[0] + 1,
-                        two_sign=2,
-                        l=self.mmax_list[0] + 1,
-                    )
 
             # Compute messages
             with P.record_function("so2_block"):
@@ -944,22 +771,12 @@ class MessageBlock(torch.nn.Module):
             ActSave({"x_updated": x})
 
             # assert x.dtype == torch.float16
-            if OPTIMIZE:
-                x = fused_s2_pointwise_nonlinearity_and_rotate_inv_combined_optimized(
-                    x,
-                    self.rh_grid.to_grid_sh_rh,
-                    SO3_edge_rot.wigner_inv_from_grid,
-                )
-                ActSave({"x_updated_post_nonlinearity_and_rot_inv": x})
-            else:
-                x = fused_s2_pointwise_nonlinearity_and_rotate_inv_combined_unoptimized(
-                    x,
-                    self.rh_grid.to_grid_sh_rh,
-                    self.rh_grid.from_grid_sh_tri,
-                    SO3_edge_rot.full_wigner_inv,
-                    self.masker,
-                )
-                ActSave({"x_updated_post_nonlinearity_and_rot_inv_unoptimized": x})
+            x = ops.fused_s2_pointwise_nonlinearity_and_rotate_inv(
+                x,
+                self.rh_grid.to_grid_sh_rh,
+                SO3_edge_rot.wigner_inv_from_grid,
+            )
+            ActSave({"x_updated_post_nonlinearity_and_rot_inv": x})
 
             with P.record_function("message_scatter"):
                 # Compute the sum of the incoming neighboring messages for each target node
@@ -1328,7 +1145,7 @@ class SO2BlockPlusPlus(torch.nn.Module):
 
         # Load the weights
         so2_conv_layers = [
-            ((i, m), filter_ckpt(state_dict, f"so2_conv.{i}."))
+            ((i, m), _filter_ckpt(state_dict, f"so2_conv.{i}."))
             for i, m in enumerate(range(1, mmax + 1))
         ]
 
