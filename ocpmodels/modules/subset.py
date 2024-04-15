@@ -1,5 +1,5 @@
 from collections.abc import Sequence, Sized
-from typing import Any, Generic, Protocol, runtime_checkable
+from typing import Any, Generic, Optional, Protocol, runtime_checkable
 
 from torch.utils.data import Dataset
 from torch.utils.data import Subset as _Subset
@@ -32,7 +32,7 @@ class OverfitSubset(Dataset[T], _DatasetMixin[T], Generic[T]):
         self,
         dataset: Dataset[T],
         samples: int,
-        size: int | None = None,
+        size: Optional[int] = None,
     ) -> None:
         super().__init__()
 

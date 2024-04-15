@@ -3,9 +3,6 @@ import torch
 from torch_geometric.nn import radius_graph
 from torch_scatter import segment_coo, segment_csr
 
-# from ...modules.padded_collater import prepend_padding_edges
-# from ...trainers.base_trainer import _PaddedCollaterConfig
-
 
 def get_pbc_distances(
     pos,
@@ -332,7 +329,6 @@ def compute_neighbors(
     return neighbors
 
 
-@torch.compiler.disable
 def generate_graph(
     pos: torch.Tensor,
     cell: torch.Tensor,
@@ -344,7 +340,6 @@ def generate_graph(
     use_pbc: bool,
     otf_graph: bool,
     enforce_max_neighbors_strictly: bool = False,
-    padded_collater_config: None = None,
 ):
     assert otf_graph
     del otf_graph
@@ -358,20 +353,6 @@ def generate_graph(
             max_neighbors,
             enforce_max_neighbors_strictly,
         )
-
-        if padded_collater_config is not None and padded_collater_config["enabled"]:
-            num_valid_edges = edge_index.shape[1]
-            edge_index, (cell_offsets,) = prepend_padding_edges(
-                edge_index,
-                (cell_offsets,),
-                padded_collater_config["max_num_edges"],
-            )
-            num_padding_edges = edge_index.shape[1] - num_valid_edges
-
-            # Update the neighbors tensor for the padded edges
-            neighbors[0] = neighbors[0] + num_padding_edges
-
-            assert int(neighbors.sum().item()) == edge_index.shape[1]
 
         out = get_pbc_distances(
             pos,

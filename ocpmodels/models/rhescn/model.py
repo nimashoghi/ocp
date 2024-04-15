@@ -8,8 +8,7 @@ LICENSE file in the root directory of this source tree.
 import logging
 import sys
 import time
-from collections.abc import Mapping
-from typing import List
+from typing import List, Mapping, Optional
 
 import numpy as np
 import torch
@@ -17,7 +16,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange
 from jaxtyping import Float, Int
-from ll import ActSave
 from torch.autograd import profiler as P
 from torch_scatter import scatter
 from typing_extensions import override
@@ -33,6 +31,7 @@ from ocpmodels.models.scn.smearing import (
 )
 
 from . import ops
+from ._actsave_stub import ActSave
 from .escn_compat import escn_compat_apply_tri_mask, eSCNCompatConfig
 from .grid import RhomboidalS2Grid
 from .precomputes import RhomboidalPrecomputes
@@ -45,9 +44,6 @@ from .util import rearrange_view, tassert
 
 def _filter_ckpt(state_dict: Mapping[str, torch.Tensor], prefix: str):
     return {k[len(prefix) :]: v for k, v in state_dict.items() if k.startswith(prefix)}
-
-
-OPTIMIZE = True
 
 
 class M0L0Embedding(nn.Module):
@@ -93,7 +89,7 @@ def _opt_einsum():
         _ = torch.backends.opt_einsum.set_flags(True, "optimal")
         # _ = torch.backends.opt_einsum.set_flags(False)
     except ImportError:
-        pass
+        print("torch.backends.opt_einsum not found. Skipping optimal flag...")
 
 
 @registry.register_model("rhescn")
@@ -128,11 +124,11 @@ class RHESCN(BaseModel):
         grid_fp16: bool = False,
         opt_einsum: bool = True,
         opt_wigner: bool = True,
-        grid_res: tuple[int, int] | None = None,
-        conv_grid_res: tuple[int, int] | None = None,
-        load_from_ckpt: str | None = None,
-        x_message_lmax: int | None = None,
-        x_message_mmax: int | None = None,
+        grid_res: Optional[tuple[int, int]] = None,
+        conv_grid_res: Optional[tuple[int, int]] = None,
+        load_from_ckpt: Optional[str] = None,
+        x_message_lmax: Optional[int] = None,
+        x_message_mmax: Optional[int] = None,
     ) -> None:
         super().__init__()
 
@@ -503,8 +499,8 @@ class LayerBlock(torch.nn.Module):
         # SO3_grid: SO3_Grid,
         rh_grid: RhomboidalS2Grid,
         act,
-        escn_compat_config: eSCNCompatConfig | None = None,
-        conv_rh_grid: RhomboidalS2Grid | None = None,
+        escn_compat_config: Optional[eSCNCompatConfig] = None,
+        conv_rh_grid: Optional[RhomboidalS2Grid] = None,
     ) -> None:
         super(LayerBlock, self).__init__()
         self.layer_idx = layer_idx
@@ -640,7 +636,7 @@ class MessageBlock(torch.nn.Module):
         # SO3_grid: SO3_Grid,
         rh_grid: RhomboidalS2Grid,
         act,
-        escn_compat_config: eSCNCompatConfig | None = None,
+        escn_compat_config: Optional[eSCNCompatConfig] = None,
     ) -> None:
         super(MessageBlock, self).__init__()
         self.layer_idx = layer_idx

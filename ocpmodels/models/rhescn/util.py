@@ -1,11 +1,23 @@
-from typing import TYPE_CHECKING, Any, Literal
+from typing import TYPE_CHECKING, Any, List, Literal
 
 import jaxtyping
 import torch
 from einops import rearrange
-from jaxtyping._storage import get_shape_memo, shape_str
-from lovely_tensors import lovely
 from typing_extensions import TypeVar
+
+try:
+    from lovely_tensors import lovely
+except ImportError:
+
+    def lovely(x):
+        return repr(x)
+
+
+try:
+    from jaxtyping._storage import get_shape_memo, shape_str
+except ImportError:
+    get_shape_memo = None
+    shape_str = None
 
 
 def rearrange_view(x: torch.Tensor, pattern: str, **axes_lengths: int):
@@ -27,13 +39,15 @@ T = TypeVar("T", infer_variance=True)
 
 
 def _make_error_str(input: Any, t: Any) -> str:
-    error_components: list[str] = []
+    error_components: List[str] = []
     error_components.append("Type checking error:")
     if hasattr(t, "__instancecheck_str__"):
         error_components.append(t.__instancecheck_str__(input))
     if torch.is_tensor(input):
         error_components.append(repr(lovely(input)))
-    error_components.append(shape_str(get_shape_memo()))
+
+    if get_shape_memo is not None and shape_str is not None:
+        error_components.append(shape_str(get_shape_memo()))
 
     return "\n".join(error_components)
 

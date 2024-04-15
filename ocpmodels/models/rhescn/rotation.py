@@ -6,10 +6,10 @@ import torch.nn.functional as F
 from e3nn import o3
 from einops import rearrange, repeat
 from jaxtyping import Float
-from ll import ActSave
 
 from ocpmodels.modules import profiler as P
 
+from ._actsave_stub import ActSave
 from .escn_compat import escn_compat_apply_tri_mask, eSCNCompatConfig
 from .precomputes import RhomboidalPrecomputes
 
@@ -172,7 +172,10 @@ class ComputedWignerMatrices(NamedTuple):
     wigner_inv_from_grid: Float[torch.Tensor, "E l_sq res_beta*res_alpha"]
 
 
-def _init_edge_rot_mat(edge_distance_vec: torch.Tensor, seed: int | None = None):
+def _init_edge_rot_mat(
+    edge_distance_vec: torch.Tensor,
+    seed: Optional[int] = None,
+):
     generator = torch.Generator(device=edge_distance_vec.device)
     if seed is not None:
         generator = generator.manual_seed(seed)
@@ -247,10 +250,10 @@ def rot_from_xyz(
     from_grid_sh_tri: Float[torch.Tensor, "res_beta*res_alpha l_sq"],
     precomputes: RhomboidalPrecomputes,
     rh_idx: torch.Tensor,
-    rotmat_seed: int | None = None,
-    device: torch.device | None = None,
-    dtype: torch.dtype | None = None,
-    escn_compat_config: eSCNCompatConfig | None,
+    rotmat_seed: Optional[int] = None,
+    device: Optional[torch.device] = None,
+    dtype: Optional[torch.dtype] = None,
+    escn_compat_config: Optional[eSCNCompatConfig],
 ):
     device = xyz.device if device is None else device
     dtype = xyz.dtype if dtype is None else dtype

@@ -1,15 +1,15 @@
-from typing import NamedTuple
+from typing import NamedTuple, Optional
 
 import torch
 
 
 class eSCNCompatConfig(NamedTuple):
-    lmax: int | None
-    mmax: int | None
+    lmax: Optional[int]
+    mmax: Optional[int]
 
 
 def escn_compat_apply_tri_mmax_mask(
-    config: eSCNCompatConfig | None,
+    config: Optional[eSCNCompatConfig],
     x: torch.Tensor,
     dim: int = 1,
 ):
@@ -39,7 +39,7 @@ def escn_compat_apply_tri_mmax_mask(
 
 
 def escn_compat_apply_tri_mask(
-    config: eSCNCompatConfig | None,
+    config: Optional[eSCNCompatConfig],
     x: torch.Tensor,
     dim: int = 1,
     with_mmax: bool = False,

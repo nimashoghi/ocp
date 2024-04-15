@@ -81,7 +81,7 @@ class RhomboidalS2Grid(nn.Module):
     def __init__(
         self,
         mmax: int,
-        escn_compat_config: eSCNCompatConfig | None = None,
+        escn_compat_config: Optional[eSCNCompatConfig] = None,
         res: Optional[Tuple[int, int]] = None,
         normalization: Normalization = "integral",
         grid_fp16: bool = False,
