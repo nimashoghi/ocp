@@ -129,6 +129,7 @@ class RHESCN(BaseModel):
         load_from_ckpt: Optional[str] = None,
         x_message_lmax: Optional[int] = None,
         x_message_mmax: Optional[int] = None,
+        stacked_m0: bool = False,
     ) -> None:
         super().__init__()
 
@@ -166,11 +167,13 @@ class RHESCN(BaseModel):
             if (x_message_lmax is not None or x_message_mmax is not None)
             else None
         )
+        self.stacked_m0 = stacked_m0
 
         self.precomputes = RhomboidalPrecomputes(
             self.lmax_list[0],
             self.mmax_list[0],
             wigner_fp16=self.wigner_fp16,
+            stacked_m0=self.stacked_m0,
         )
         # self.jdp = JdPrecomputed(self.lmax_list[0], wigner_fp16=self.wigner_fp16)
 
@@ -244,6 +247,7 @@ class RHESCN(BaseModel):
             self.escn_compat_config,
             grid_fp16=grid_fp16,
             res=grid_res,
+            stacked_m0=self.stacked_m0,
         )
 
         if conv_grid_res is not None:
@@ -252,6 +256,7 @@ class RHESCN(BaseModel):
                 self.escn_compat_config,
                 grid_fp16=grid_fp16,
                 res=conv_grid_res,
+                stacked_m0=self.stacked_m0,
             )
         else:
             conv_rh_grid = self.rh_grid
@@ -273,6 +278,7 @@ class RHESCN(BaseModel):
                 self.act,
                 conv_rh_grid=conv_rh_grid,
                 escn_compat_config=self.escn_compat_config,
+                stacked_m0=self.stacked_m0,
             )
             self.layer_blocks.append(block)
 
@@ -387,6 +393,7 @@ class RHESCN(BaseModel):
                 from_grid_sh_tri=self.rh_grid.from_grid_sh_tri,
                 precomputes=self.precomputes,
                 rh_idx=self.precomputes.rh_idx,
+                rh_mask=self.precomputes.rh_mask,
                 escn_compat_config=self.escn_compat_config,
                 device=device,
                 dtype=dtype,
@@ -501,6 +508,8 @@ class LayerBlock(torch.nn.Module):
         act,
         escn_compat_config: Optional[eSCNCompatConfig] = None,
         conv_rh_grid: Optional[RhomboidalS2Grid] = None,
+        *,
+        stacked_m0: bool = False,
     ) -> None:
         super(LayerBlock, self).__init__()
         self.layer_idx = layer_idx
@@ -513,6 +522,7 @@ class LayerBlock(torch.nn.Module):
         # self.SO3_grid = SO3_grid
         self.rh_grid = rh_grid
         self.escn_compat_config = escn_compat_config
+        self.stacked_m0 = stacked_m0
 
         if conv_rh_grid is None:
             conv_rh_grid = rh_grid
@@ -532,6 +542,7 @@ class LayerBlock(torch.nn.Module):
             rh_grid,
             self.act,
             self.escn_compat_config,
+            stacked_m0=self.stacked_m0,
         )
 
         # Non-linear point-wise comvolution for the aggregated messages
@@ -637,6 +648,8 @@ class MessageBlock(torch.nn.Module):
         rh_grid: RhomboidalS2Grid,
         act,
         escn_compat_config: Optional[eSCNCompatConfig] = None,
+        *,
+        stacked_m0: bool = False,
     ) -> None:
         super(MessageBlock, self).__init__()
         self.layer_idx = layer_idx
@@ -650,6 +663,7 @@ class MessageBlock(torch.nn.Module):
         self.mmax_list = mmax_list
         self.edge_channels = edge_channels
         self.escn_compat_config = escn_compat_config
+        self.stacked_m0 = stacked_m0
 
         # Create edge scalar (invariant to rotations) features
         self.edge_block = EdgeBlock(
@@ -665,6 +679,7 @@ class MessageBlock(torch.nn.Module):
             self.lmax_list,
             self.mmax_list,
             self.act,
+            stacked_m0=self.stacked_m0,
         )
         self.so2_block_target = SO2BlockPlusPlus(
             self.sphere_channels,
@@ -673,6 +688,7 @@ class MessageBlock(torch.nn.Module):
             self.lmax_list,
             self.mmax_list,
             self.act,
+            stacked_m0=self.stacked_m0,
         )
 
     def load_from_escn_state_dict(self, state_dict: dict[str, torch.Tensor]):
@@ -932,18 +948,6 @@ def xavier_normal_(tensor: torch.Tensor, gain: float = 1.0) -> torch.Tensor:
 
 
 class SO2BlockPlusPlusM0(torch.nn.Module):
-    """
-    SO(2) Block: Perform SO(2) convolutions for all m (orders)
-
-    Args:
-        sphere_channels (int):      Number of spherical channels
-        hidden_channels (int):      Number of hidden channels used during the SO(2) conv
-        edge_channels (int):        Size of invariant edge embedding
-        lmax_list (list:int):       List of degrees (l) for each resolution
-        mmax_list (list:int):       List of orders (m) for each resolution
-        act (function):             Non-linear activation function
-    """
-
     def __init__(
         self,
         sphere_channels: int,
@@ -952,6 +956,8 @@ class SO2BlockPlusPlusM0(torch.nn.Module):
         lmax_list: List[int],
         mmax_list: List[int],
         act,
+        *,
+        stacked_m0: bool = False,
     ) -> None:
         super().__init__()
 
@@ -959,13 +965,17 @@ class SO2BlockPlusPlusM0(torch.nn.Module):
         self.hidden_channels = hidden_channels
         self.mmax = mmax_list[0]
         self.act = act
+        self.stacked_m0 = stacked_m0
 
         num_channels_m0 = (self.mmax + 1) * self.sphere_channels
+        if self.stacked_m0:
+            num_channels_m0 *= 2
 
         self.fc1_dist0 = nn.Linear(edge_channels, self.hidden_channels)
         self.fc1_m0 = nn.Linear(num_channels_m0, self.hidden_channels, bias=False)
         self.fc2_m0 = nn.Linear(self.hidden_channels, num_channels_m0, bias=False)
 
+    @override
     def forward(
         self,
         x_0: Float[torch.Tensor, "E two_sign l C"],
@@ -976,7 +986,14 @@ class SO2BlockPlusPlusM0(torch.nn.Module):
         ActSave({"x_edge_m0": x_edge_0})
         # ^ Shape: E H
 
-        x_0 = x_0[:, signidx(+1)]
+        if self.stacked_m0:
+            # In this case, we can treat the -m indices
+            #   as the continuation of the +m indices (e.g.,
+            #   if mmax=2, then: [[0, 1, 2], [3, 4, 5]])
+            x_0 = torch.cat([x_0[:, signidx(+1)], x_0[:, signidx(-1)]], dim=1)
+        else:
+            x_0 = x_0[:, signidx(+1)]
+
         ActSave({"x_m0": x_0})
         x_0 = rearrange_view(x_0, "E l C -> E (l C)")
 
@@ -1033,11 +1050,15 @@ class SO2BlockPlusPlus(torch.nn.Module):
         lmax_list: List[int],
         mmax_list: List[int],
         act,
+        *,
+        stacked_m0: bool = False,
     ) -> None:
         super().__init__()
 
         self.mmax = mmax_list[0]
         self.act = act
+        self.stacked_m0 = stacked_m0
+
         m = self.mmax  # This is no longer mmax+1 because m=0 is handled separately
         l = self.mmax + 1
         C = sphere_channels
@@ -1067,6 +1088,7 @@ class SO2BlockPlusPlus(torch.nn.Module):
             lmax_list,
             mmax_list,
             act,
+            stacked_m0=self.stacked_m0,
         )
 
     def _load_edge_invariant_weights(self, mmax, so2_conv_layers):
@@ -1117,6 +1139,9 @@ class SO2BlockPlusPlus(torch.nn.Module):
         model_state_dict: dict[str, torch.Tensor] = {}
 
         # First, handle m=0
+        assert (
+            not self.m0_block.stacked_m0
+        ), "Stacked m=0 is not supported for compat eSCN checkpoint loading"
         model_state_dict.update(
             {
                 "m0_block.fc1_dist0.weight": state_dict["fc1_dist0.weight"],

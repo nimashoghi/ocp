@@ -164,11 +164,12 @@ class RhomboidalPrecomputes(nn.Module):
         lmax: int,
         mmax: int,
         wigner_fp16: bool = False,
+        stacked_m0: bool = False,
     ) -> None:
         super().__init__()
 
         # Set up rhomboidal idx/mask
-        idx, mask = compute_idx_and_mask(mmax)
+        idx, mask = compute_idx_and_mask(mmax, stacked_m0=stacked_m0)
         self.register_buffer("rh_idx", idx, persistent=False)
         self.register_buffer("rh_mask", mask, persistent=False)
 

@@ -57,15 +57,15 @@ def _grid_precomputes_optimized(
 def _grid_sh_tri_to_rh(
     sh: Float[torch.Tensor, "res_beta res_alpha l_sq"],
     mmax: int,
+    *,
+    stacked_m0: bool = False,
 ) -> Float[torch.Tensor, "res_beta res_alpha m 2 l"]:
     # l_sq = (lmax+1)**2
     lmax = 2 * mmax
     assert sh.shape[-1] == (lmax + 1) ** 2
-    # idx, mask = compute_idx_and_mask(mmax)
-    # sh_rh = sh[..., idx] * mask
 
-    idx, _ = compute_idx_and_mask(mmax)
-    sh_rh = sh[..., idx]  # * mask
+    idx, mask = compute_idx_and_mask(mmax, stacked_m0=stacked_m0)
+    sh_rh = sh[..., idx] * mask
     return sh_rh
 
 
@@ -85,6 +85,7 @@ class RhomboidalS2Grid(nn.Module):
         res: Optional[Tuple[int, int]] = None,
         normalization: Normalization = "integral",
         grid_fp16: bool = False,
+        stacked_m0: bool = False,
     ):
         super().__init__()
 
@@ -108,7 +109,7 @@ class RhomboidalS2Grid(nn.Module):
             normalization=normalization,
         )
         (to_grid_sh_rh, from_grid_sh_rh) = map(
-            functools.partial(_grid_sh_tri_to_rh, mmax=mmax),
+            functools.partial(_grid_sh_tri_to_rh, mmax=mmax, stacked_m0=stacked_m0),
             (to_grid_sh_tri, from_grid_sh_tri),
         )
 

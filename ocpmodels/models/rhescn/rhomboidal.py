@@ -37,7 +37,11 @@ def _l_m_idxs(lmax: int):
     return forward, inverse
 
 
-def compute_idx_and_mask(mmax: int):
+def compute_idx_and_mask(
+    mmax: int,
+    *,
+    stacked_m0: bool = False,
+):
     lmax = 2 * mmax
 
     idx = torch.zeros((mmax + 1, 2, mmax + 1), dtype=torch.long)
@@ -52,17 +56,18 @@ def compute_idx_and_mask(mmax: int):
                 continue
 
             idx[m, signidx(+1), l_idx] = idx_fn(l, m)
-            # If m == 0, we set the negative indices to be
-            #  the (mmax + |l|)th index
-            if m == 0:
-                idx[m, signidx(-1), l_idx] = idx_fn(l + mmax, m)
-            # Otherwise (m > 0), we set the `-m` indices.
-            else:
+            # If m > 0, we set the `-m` indices.
+            if m > 0:
                 idx[m, signidx(-1), l_idx] = idx_fn(l, -m)
+                continue
 
-    # Mask out m=0 negative indices
-    for l in range(mmax):
-        # mask = mask.at[0, signidx(-1), :].set(False)
-        mask[0, signidx(-1), :] = False
+            assert m == 0
+            # Otherwise (m == 0), we set the negative indices to be
+            #  the (mmax + |l|)th index if `stacked_m0` is True, otherwise
+            #  we mask them out.
+            if stacked_m0:
+                idx[m, signidx(-1), l_idx] = idx_fn(l + mmax, m)
+            else:
+                mask[m, signidx(-1), l_idx] = False
 
     return idx, mask

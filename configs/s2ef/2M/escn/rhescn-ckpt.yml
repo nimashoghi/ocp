@@ -78,6 +78,7 @@ model:
 
     # x_message_lmax: 4
     # x_message_mmax: 2
+    stacked_m0: True
 
 optim:
     batch_size: 2

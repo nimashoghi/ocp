@@ -250,6 +250,7 @@ def rot_from_xyz(
     from_grid_sh_tri: Float[torch.Tensor, "res_beta*res_alpha l_sq"],
     precomputes: RhomboidalPrecomputes,
     rh_idx: torch.Tensor,
+    rh_mask: torch.Tensor,
     rotmat_seed: Optional[int] = None,
     device: Optional[torch.device] = None,
     dtype: Optional[torch.dtype] = None,
@@ -277,7 +278,7 @@ def rot_from_xyz(
     ActSave({"full_wigner": full_wigner})
 
     with P.record_function("prepare_wigner"):
-        wigner = full_wigner.transpose(-1, -2)[..., rh_idx]  # * rh_mask[None, None]
+        wigner = full_wigner.transpose(-1, -2)[..., rh_idx] * rh_mask[None, None]
 
         # wigner = repeat(wigner, "... -> two_st ...", two_st=2)
         wigner = rearrange(wigner, "E l_sq m1 two_sign m2 -> E (m1 two_sign m2) l_sq")
