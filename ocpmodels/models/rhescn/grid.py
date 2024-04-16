@@ -21,11 +21,12 @@ def _grid_precomputes_optimized(
     dtype: torch.dtype = torch.float,
     device: Optional[torch.device] = None,
     normalization: Normalization = "integral",
-) -> tuple[
+) -> Tuple[
     Float[torch.Tensor, "beta alpha l_sq"],
     Float[torch.Tensor, "beta alpha l_sq"],
 ]:
-    from e3nn.o3 import FromS2Grid, ToS2Grid
+    # from e3nn.o3 import FromS2Grid, ToS2Grid
+    from ._e3nn_s2grid import FromS2Grid, ToS2Grid
 
     if device is None:
         device = torch.device("cpu")

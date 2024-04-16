@@ -8,13 +8,13 @@ LICENSE file in the root directory of this source tree.
 import logging
 import sys
 import time
-from typing import List, Mapping, Optional
+from typing import Dict, List, Mapping, Optional, Tuple
 
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from einops import rearrange
+from einops import pack, rearrange
 from jaxtyping import Float, Int
 from torch.autograd import profiler as P
 from torch_scatter import scatter
@@ -124,12 +124,13 @@ class RHESCN(BaseModel):
         grid_fp16: bool = False,
         opt_einsum: bool = True,
         opt_wigner: bool = True,
-        grid_res: Optional[tuple[int, int]] = None,
-        conv_grid_res: Optional[tuple[int, int]] = None,
+        grid_res: Optional[Tuple[int, int]] = None,
+        conv_grid_res: Optional[Tuple[int, int]] = None,
         load_from_ckpt: Optional[str] = None,
         x_message_lmax: Optional[int] = None,
         x_message_mmax: Optional[int] = None,
         stacked_m0: bool = False,
+        skip_first_layer: bool = True,
     ) -> None:
         super().__init__()
 
@@ -168,6 +169,7 @@ class RHESCN(BaseModel):
             else None
         )
         self.stacked_m0 = stacked_m0
+        self.skip_first_layer = skip_first_layer
 
         self.precomputes = RhomboidalPrecomputes(
             self.lmax_list[0],
@@ -279,6 +281,7 @@ class RHESCN(BaseModel):
                 conv_rh_grid=conv_rh_grid,
                 escn_compat_config=self.escn_compat_config,
                 stacked_m0=self.stacked_m0,
+                skip_layer=self.skip_first_layer and i == 0,
             )
             self.layer_blocks.append(block)
 
@@ -305,7 +308,7 @@ class RHESCN(BaseModel):
                 _filter_ckpt(ckpt["state_dict"], "module.module.")
             )
 
-    def load_from_escn_state_dict(self, state_dict: dict[str, torch.Tensor]):
+    def load_from_escn_state_dict(self, state_dict: Dict[str, torch.Tensor]):
         self.sphere_embedding.embedding.load_state_dict(
             _filter_ckpt(state_dict, "sphere_embedding.")
         )
@@ -325,33 +328,43 @@ class RHESCN(BaseModel):
             )
 
     # @conditional_grad(torch.enable_grad())
-    def forward(self, batch):
-        pos = batch.pos
-        atomic_numbers = batch.atomic_numbers.long()
-        cell = batch.cell
-        natoms = batch.natoms
-        # edge_index = batch.edge_index
-        # edge_distance = batch.edge_distance
-        # edge_distance_vec = batch.edge_distance_vec
-        batch = batch.batch
+    def forward(self, data):
+        pos = data.pos
+        atomic_numbers = data.atomic_numbers.long()
+        cell = data.cell
+        natoms = data.natoms
+        # edge_index = data.edge_index
+        # edge_distance = data.edge_distance
+        # edge_distance_vec = data.edge_distance_vec
+        batch = data.batch
 
-        (
-            edge_index,
-            edge_distance,
-            edge_distance_vec,
-            cell_offsets,
-            _,  # cell offset distances
-            neighbors,
-        ) = generate_graph(
-            pos,
-            cell,
-            batch,
-            natoms,
-            cutoff=self.cutoff,
-            max_neighbors=self.max_neighbors,
-            use_pbc=self.use_pbc,
-            otf_graph=self.otf_graph,
-        )
+        if False:
+            (
+                edge_index,
+                edge_distance,
+                edge_distance_vec,
+                cell_offsets,
+                _,  # cell offset distances
+                neighbors,
+            ) = generate_graph(
+                pos,
+                cell,
+                batch,
+                natoms,
+                cutoff=self.cutoff,
+                max_neighbors=self.max_neighbors,
+                use_pbc=self.use_pbc,
+                otf_graph=self.otf_graph,
+            )
+        else:
+            (
+                edge_index,
+                edge_distance,
+                edge_distance_vec,
+                cell_offsets,
+                _,  # cell offset distances
+                neighbors,
+            ) = self.generate_graph(data)
 
         device = pos.device
         self.batch_size = natoms.shape[0]
@@ -510,6 +523,7 @@ class LayerBlock(torch.nn.Module):
         conv_rh_grid: Optional[RhomboidalS2Grid] = None,
         *,
         stacked_m0: bool = False,
+        skip_layer: bool = False,
     ) -> None:
         super(LayerBlock, self).__init__()
         self.layer_idx = layer_idx
@@ -523,6 +537,7 @@ class LayerBlock(torch.nn.Module):
         self.rh_grid = rh_grid
         self.escn_compat_config = escn_compat_config
         self.stacked_m0 = stacked_m0
+        self.skip_layer = skip_layer
 
         if conv_rh_grid is None:
             conv_rh_grid = rh_grid
@@ -543,6 +558,7 @@ class LayerBlock(torch.nn.Module):
             self.act,
             self.escn_compat_config,
             stacked_m0=self.stacked_m0,
+            skip_layer=self.skip_layer,
         )
 
         # Non-linear point-wise comvolution for the aggregated messages
@@ -558,7 +574,7 @@ class LayerBlock(torch.nn.Module):
             self.sphere_channels_all, self.sphere_channels_all, bias=False
         )
 
-    def load_from_escn_state_dict(self, state_dict: dict[str, torch.Tensor]):
+    def load_from_escn_state_dict(self, state_dict: Dict[str, torch.Tensor]):
         self.fc1_sphere.load_state_dict(_filter_ckpt(state_dict, "fc1_sphere."))
         self.fc2_sphere.load_state_dict(_filter_ckpt(state_dict, "fc2_sphere."))
         self.fc3_sphere.load_state_dict(_filter_ckpt(state_dict, "fc3_sphere."))
@@ -650,6 +666,7 @@ class MessageBlock(torch.nn.Module):
         escn_compat_config: Optional[eSCNCompatConfig] = None,
         *,
         stacked_m0: bool = False,
+        skip_layer: bool = False,
     ) -> None:
         super(MessageBlock, self).__init__()
         self.layer_idx = layer_idx
@@ -664,6 +681,7 @@ class MessageBlock(torch.nn.Module):
         self.edge_channels = edge_channels
         self.escn_compat_config = escn_compat_config
         self.stacked_m0 = stacked_m0
+        self.skip_layer = skip_layer
 
         # Create edge scalar (invariant to rotations) features
         self.edge_block = EdgeBlock(
@@ -680,6 +698,7 @@ class MessageBlock(torch.nn.Module):
             self.mmax_list,
             self.act,
             stacked_m0=self.stacked_m0,
+            skip_layer=self.skip_layer,
         )
         self.so2_block_target = SO2BlockPlusPlus(
             self.sphere_channels,
@@ -689,9 +708,10 @@ class MessageBlock(torch.nn.Module):
             self.mmax_list,
             self.act,
             stacked_m0=self.stacked_m0,
+            skip_layer=self.skip_layer,
         )
 
-    def load_from_escn_state_dict(self, state_dict: dict[str, torch.Tensor]):
+    def load_from_escn_state_dict(self, state_dict: Dict[str, torch.Tensor]):
         self.edge_block.load_from_escn_state_dict(
             _filter_ckpt(state_dict, "edge_block.")
         )
@@ -986,11 +1006,12 @@ class SO2BlockPlusPlusM0(torch.nn.Module):
         ActSave({"x_edge_m0": x_edge_0})
         # ^ Shape: E H
 
+        _, two_sign, l, C = x_0.shape
         if self.stacked_m0:
             # In this case, we can treat the -m indices
             #   as the continuation of the +m indices (e.g.,
             #   if mmax=2, then: [[0, 1, 2], [3, 4, 5]])
-            x_0 = torch.cat([x_0[:, signidx(+1)], x_0[:, signidx(-1)]], dim=1)
+            x_0, _ = pack([x_0[:, signidx(+1)], x_0[:, signidx(-1)]], "E * C")
         else:
             x_0 = x_0[:, signidx(+1)]
 
@@ -1004,18 +1025,23 @@ class SO2BlockPlusPlusM0(torch.nn.Module):
         x_0 = self.fc2_m0(x_0)
         # ^ Shape: E (l C)
 
-        x_0 = rearrange_view(
-            x_0,
-            "E (l C) -> E l C",
-            l=self.mmax + 1,
-            C=self.sphere_channels,
-        )
-        ActSave({"x_m0_updated": x_0})
-        x_0 = torch.stack([x_0, torch.zeros_like(x_0)], dim=1)  # Add back "-0"
+        if self.stacked_m0:
+            x_0 = rearrange_view(
+                x_0,
+                "E (two_sign l C) -> E two_sign l C",
+                two_sign=two_sign,
+                l=l,
+                C=C,
+            )
+            ActSave({"x_m0_updated": x_0})
+        else:
+            x_0 = rearrange_view(x_0, "E (l C) -> E l C", l=l, C=C)
+            ActSave({"x_m0_updated": x_0})
+            x_0 = torch.stack([x_0, torch.zeros_like(x_0)], dim=1)  # Add back "-0"
 
         return x_0
 
-    # def load_from_escn_state_dict(self, state_dict: dict[str, torch.Tensor]):
+    # def load_from_escn_state_dict(self, state_dict: Dict[str, torch.Tensor]):
     #     return self.load_state_dict(
     #         {
     #             "fc1_dist0.weight": state_dict["fc1_dist0.weight"],
@@ -1052,34 +1078,36 @@ class SO2BlockPlusPlus(torch.nn.Module):
         act,
         *,
         stacked_m0: bool = False,
+        skip_layer: bool = False,
     ) -> None:
         super().__init__()
 
         self.mmax = mmax_list[0]
         self.act = act
         self.stacked_m0 = stacked_m0
+        self.skip_layer = skip_layer
 
         m = self.mmax  # This is no longer mmax+1 because m=0 is handled separately
         l = self.mmax + 1
         C = sphere_channels
         H = hidden_channels
-
         two_imag = 2
-        self.edge_invariant_mlp = nn.Linear(edge_channels, two_imag * H * m)
+        if not self.skip_layer:
+            self.edge_invariant_mlp = nn.Linear(edge_channels, two_imag * H * m)
 
-        # TODO: Proper initialization
-        so2_weight_dense_1_weight = torch.randn((two_imag, m, H, l * C))
-        _ = xavier_normal_(so2_weight_dense_1_weight)
-        self.so2_weight_dense_1_weight = nn.Parameter(
-            so2_weight_dense_1_weight, requires_grad=True
-        )
+            # TODO: Proper initialization
+            so2_weight_dense_1_weight = torch.randn((two_imag, m, H, l * C))
+            _ = xavier_normal_(so2_weight_dense_1_weight)
+            self.so2_weight_dense_1_weight = nn.Parameter(
+                so2_weight_dense_1_weight, requires_grad=True
+            )
 
-        # two_st two_imag m l*C H
-        so2_weight_dense_2_weight = torch.randn((two_imag, m, l * C, H))
-        _ = xavier_normal_(so2_weight_dense_2_weight)
-        self.so2_weight_dense_2_weight = nn.Parameter(
-            so2_weight_dense_2_weight, requires_grad=True
-        )
+            # two_st two_imag m l*C H
+            so2_weight_dense_2_weight = torch.randn((two_imag, m, l * C, H))
+            _ = xavier_normal_(so2_weight_dense_2_weight)
+            self.so2_weight_dense_2_weight = nn.Parameter(
+                so2_weight_dense_2_weight, requires_grad=True
+            )
 
         self.m0_block = SO2BlockPlusPlusM0(
             sphere_channels,
@@ -1092,10 +1120,10 @@ class SO2BlockPlusPlus(torch.nn.Module):
         )
 
     def _load_edge_invariant_weights(self, mmax, so2_conv_layers):
-        edge_invariant_mlp_weights_list: list[
+        edge_invariant_mlp_weights_list: List[
             Float[torch.Tensor, "two_hidden_channels edge_channels"]
         ] = []
-        edge_invariant_mlp_biases_list: list[
+        edge_invariant_mlp_biases_list: List[
             Float[torch.Tensor, "two_hidden_channels"]
         ] = []
         for _, layer_state_dict in so2_conv_layers:
@@ -1135,23 +1163,8 @@ class SO2BlockPlusPlus(torch.nn.Module):
             "edge_invariant_mlp.bias": edge_invariant_mlp_bias,
         }
 
-    def load_from_escn_state_dict(self, state_dict: dict[str, torch.Tensor]):
-        model_state_dict: dict[str, torch.Tensor] = {}
-
-        # First, handle m=0
-        assert (
-            not self.m0_block.stacked_m0
-        ), "Stacked m=0 is not supported for compat eSCN checkpoint loading"
-        model_state_dict.update(
-            {
-                "m0_block.fc1_dist0.weight": state_dict["fc1_dist0.weight"],
-                "m0_block.fc1_dist0.bias": state_dict["fc1_dist0.bias"],
-                "m0_block.fc1_m0.weight": state_dict["fc1_m0.weight"],
-                "m0_block.fc2_m0.weight": state_dict["fc2_m0.weight"],
-            }
-        )
-
-        # Handle m>0
+    def _load_mgt0(self, state_dict: Dict[str, torch.Tensor]):
+        model_state_dict: Dict[str, torch.Tensor] = {}
         # Find the source model's mmax
         mmax_set = set[int]()
         for key in state_dict.keys():
@@ -1193,10 +1206,10 @@ class SO2BlockPlusPlus(torch.nn.Module):
             )
 
         # so2_weight_dense_1_weight
-        so2_weight_dense_1_weight_imag_list: list[
+        so2_weight_dense_1_weight_imag_list: List[
             Float[torch.Tensor, "hidden_channels l*sphere_channels"]
         ] = []
-        so2_weight_dense_1_weight_real_list: list[
+        so2_weight_dense_1_weight_real_list: List[
             Float[torch.Tensor, "hidden_channels l*sphere_channels"]
         ] = []
         for (i, m), layer_state_dict in so2_conv_layers:
@@ -1242,10 +1255,10 @@ class SO2BlockPlusPlus(torch.nn.Module):
         model_state_dict["so2_weight_dense_1_weight"] = pad_m(so2_weight_dense_1_weight)
 
         # so2_weight_dense_2_weight
-        so2_weight_dense_2_weight_imag_list: list[
+        so2_weight_dense_2_weight_imag_list: List[
             Float[torch.Tensor, "hidden_channels l*sphere_channels"]
         ] = []
-        so2_weight_dense_2_weight_real_list: list[
+        so2_weight_dense_2_weight_real_list: List[
             Float[torch.Tensor, "hidden_channels l*sphere_channels"]
         ] = []
         for _, layer_state_dict in so2_conv_layers:
@@ -1290,6 +1303,28 @@ class SO2BlockPlusPlus(torch.nn.Module):
         )
         model_state_dict["so2_weight_dense_2_weight"] = pad_m(so2_weight_dense_2_weight)
 
+        return model_state_dict
+
+    def load_from_escn_state_dict(self, state_dict: Dict[str, torch.Tensor]):
+        model_state_dict: Dict[str, torch.Tensor] = {}
+
+        # First, handle m=0
+        assert (
+            not self.m0_block.stacked_m0
+        ), "Stacked m=0 is not supported for compat eSCN checkpoint loading"
+        model_state_dict.update(
+            {
+                "m0_block.fc1_dist0.weight": state_dict["fc1_dist0.weight"],
+                "m0_block.fc1_dist0.bias": state_dict["fc1_dist0.bias"],
+                "m0_block.fc1_m0.weight": state_dict["fc1_m0.weight"],
+                "m0_block.fc2_m0.weight": state_dict["fc2_m0.weight"],
+            }
+        )
+
+        # Handle m>0
+        if not self.skip_layer:
+            model_state_dict.update(self._load_mgt0(state_dict))
+
         self.load_state_dict(model_state_dict)
 
     def forward(
@@ -1306,20 +1341,21 @@ class SO2BlockPlusPlus(torch.nn.Module):
             ActSave({"x_m0_updated": x_m0})
 
             # m>0
-            E, m, _, l, C = x_mgt0.shape
-            x_mgt0 = _fused_so2_block_both(
-                x_mgt0,
-                x_edge,
-                E,
-                m,
-                l,
-                C,
-                edge_invariant_mlp_weight=self.edge_invariant_mlp.weight,
-                edge_invariant_mlp_bias=self.edge_invariant_mlp.bias,
-                so2_weight_dense_1_weight=self.so2_weight_dense_1_weight,
-                so2_weight_dense_2_weight=self.so2_weight_dense_2_weight,
-            )
-            ActSave({"x_mgt0_updated": x_mgt0})
+            if not self.skip_layer:
+                E, m, _, l, C = x_mgt0.shape
+                x_mgt0 = _fused_so2_block_both(
+                    x_mgt0,
+                    x_edge,
+                    E,
+                    m,
+                    l,
+                    C,
+                    edge_invariant_mlp_weight=self.edge_invariant_mlp.weight,
+                    edge_invariant_mlp_bias=self.edge_invariant_mlp.bias,
+                    so2_weight_dense_1_weight=self.so2_weight_dense_1_weight,
+                    so2_weight_dense_2_weight=self.so2_weight_dense_2_weight,
+                )
+                ActSave({"x_mgt0_updated": x_mgt0})
 
             x = torch.cat((x_m0[:, None], x_mgt0), dim=1).contiguous()
             return x

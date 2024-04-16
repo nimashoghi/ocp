@@ -1,5 +1,5 @@
 from collections.abc import Sequence, Sized
-from typing import Any, Generic, Optional, Protocol, runtime_checkable
+from typing import Any, Dict, Generic, Optional, Protocol, runtime_checkable
 
 from torch.utils.data import Dataset
 from torch.utils.data import Subset as _Subset
@@ -55,7 +55,7 @@ class OverfitSubset(Dataset[T], _DatasetMixin[T], Generic[T]):
 
 
 def wrap_dataset(
-    config: dict[str, Any],
+    config: Dict[str, Any],
     dataset: Dataset[T],
     split: str,
     *,
