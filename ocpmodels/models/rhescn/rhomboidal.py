@@ -70,4 +70,9 @@ def compute_idx_and_mask(
             else:
                 mask[m, signidx(-1), l_idx] = False
 
+    # When we're stacking m=0, there will be 1 single index for the negative
+    # m=0, l=0 which we need to mask. (See figure: https://i.imgur.com/C4IRYxV.png)
+    if stacked_m0:
+        mask[0, signidx(-1), 0] = False
+
     return idx, mask
